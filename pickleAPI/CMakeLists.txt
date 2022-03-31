@@ -1,0 +1,53 @@
+cmake_minimum_required(VERSION 2.8)
+project(DolphinDBAPI)
+
+set(PYTHON "3.8" CACHE STRING "python edition")
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    message("Found ccache! ${CCACHE_PROGRAM}")
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${CCACHE_PROGRAM})
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${CCACHE_PROGRAM})
+endif(CCACHE_PROGRAM)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++11 -Wall -O0 ")
+set(CMAKE_CXX_FLAGS_RELEASE "-O0 -g")
+
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNDEBUG -D_GLIBCXX_USE_CXX11_ABI=0 -fPIC -std=c++11 -Wall -O3 ")
+#set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+
+set(SRC src)
+
+add_definitions(-DLINUX -DLOGGING_LEVEL_1)
+set(CMAKE_EXE_LINKER_FLAGS "-L . -Wl,-rpath,.")
+
+set(OPENSSL_ROOT_DIR /usr/local/ssl)
+include_directories(/usr/local/include/openssl)
+
+if(PYTHON STREQUAL "3.6")
+    include_directories(${SRC}/python3.6)
+    message("python edition is 3.6")
+elseif(PYTHON STREQUAL "3.7")
+    include_directories(${SRC}/python3.7)
+    message("python edition is 3.7")
+elseif(PYTHON STREQUAL "3.8")
+    include_directories(${SRC}/python3.8)
+    message("python edition is 3.8")
+elseif(PYTHON STREQUAL "3.9")
+    include_directories(${SRC}/python3.9)
+    message("python edition is 3.9")
+endif()
+
+include_directories(${SRC})
+aux_source_directory(${SRC}  DolphinDBSrc)
+
+#add_library(${PROJECT_NAME} SHARED  ${DolphinDBSrc} )
+
+if(PYTHON STREQUAL "3.6")
+    add_library(${PROJECT_NAME} STATIC ${DolphinDBSrc} ${SRC}/python3.6/Pickle.cpp)
+elseif(PYTHON STREQUAL "3.7")
+    add_library(${PROJECT_NAME} STATIC ${DolphinDBSrc} ${SRC}/python3.7/Pickle.cpp)
+elseif(PYTHON STREQUAL "3.8")
+    add_library(${PROJECT_NAME} STATIC ${DolphinDBSrc} ${SRC}/python3.8/Pickle.cpp)
+elseif(PYTHON STREQUAL "3.9")
+    add_library(${PROJECT_NAME} STATIC ${DolphinDBSrc} ${SRC}/python3.9/Pickle.cpp)
+endif()
