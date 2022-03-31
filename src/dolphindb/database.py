@@ -22,7 +22,7 @@ class Database(object):
         self.__session.run(runstr)
         return self.__session.loadTable(ctHandle)
 
-    def createPartitionedTable(self, table=None, tableName=None, partitionColumns=None):
+    def createPartitionedTable(self, table=None, tableName=None, partitionColumns=None, compressMethods=[], sortColumns=None, keepDuplicates=""):
         if not isinstance(table, Table):
             raise RuntimeError("Only DolphinDB Table object is accepted")
         
@@ -39,6 +39,23 @@ class Database(object):
         else:
             raise RuntimeError("Only String or List of String is accepted for partitionColumns")
 
-        runstr = cptHandle + "=" + self.__dbName + ".createPartitionedTable(" + tHandle + "," + "`" + tableName + ","  + partitionColumns_str + ");"
+        runstr = cptHandle + "=" + self.__dbName + ".createPartitionedTable(" + tHandle + "," + "`" + tableName + ","  + partitionColumns_str
+        if len(compressMethods) > 0 :
+            runstr += ",compressMethods=["
+            for key in compressMethods:
+                runstr += "'"+key+"',"
+            runstr = runstr[:-1]+"]"
+        if sortColumns is not None :
+            if type(sortColumns) == str:
+                runstr += ",sortColumns='"+sortColumns+"'"
+            elif type(sortColumns) == list:
+                runstr += ",sortColumns=["
+                for key in sortColumns:
+                    runstr += "'"+key+"',"
+                runstr = runstr[:-1]+"]"
+
+        if len(keepDuplicates) > 0 :
+            runstr += ",keepDuplicates="+keepDuplicates
+        runstr+=");"
         self.__session.run(runstr)
         return self.__session.loadTable(cptHandle)

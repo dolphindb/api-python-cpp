@@ -110,3 +110,15 @@ RANGE=2
 LIST=3
 COMPO=4
 HASH =5
+
+# VERBOSE
+VERBOSE = False
+
+
+def set_verbose(verbose=False):
+    global VERBOSE
+    VERBOSE = verbose
+
+
+def get_verbose():
+    return VERBOSE

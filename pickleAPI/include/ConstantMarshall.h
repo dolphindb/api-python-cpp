@@ -25,26 +25,27 @@ class CodeUnmarshall;
 class ConstantMarshallFactory;
 class ConstantUnmarshallFactory;
 class SymbolBaseUnmarshall;
+class SymbolBaseMarshall;
 
 typedef SmartPointer<CodeMarshall> CodeMarshallSP;
 typedef SmartPointer<CodeUnmarshall> CodeUnmarshallSP;
 typedef SmartPointer<ConstantMarshallFactory> ConstantMarshallFactorySP;
 typedef SmartPointer<ConstantUnmarshallFactory> ConstantUnmarshallFactorySP;
-typedef SmartPointer<vector<string>> SymbolBaseSP;
 typedef SmartPointer<SymbolBaseUnmarshall> SymbolBaseUnmarshallSP;
+typedef SmartPointer<SymbolBaseMarshall> SymbolBaseMarshallSP;
 
 class EXPORT_DECL ConstantMarshallImp : public ConstantMarshall {
 public:
 	ConstantMarshallImp(const DataOutputStreamSP& out):out_(out), complete_(false){}
 	virtual ~ConstantMarshallImp(){}
-	virtual bool start(const ConstantSP& target, bool blocking, IO_ERR& ret){
-		return start(0, 0, target, blocking, ret);
+	virtual bool start(const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret){
+		return start(0, 0, target, blocking, compress, ret);
 	}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret)=0;
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret)=0;
 	virtual IO_ERR flush();
 
 protected:
-	short encodeFlag(const ConstantSP& target);
+	short encodeFlag(const ConstantSP& target, COMPRESS_METHOD compress = COMPRESS_METHOD::COMPRESS_NONE);
 protected:
 	BufferWriter<DataOutputStreamSP> out_;
 	ConstantSP target_;
@@ -63,12 +64,28 @@ protected:
 	DataInputStreamSP in_;
 };
 
+class EXPORT_DECL SymbolBaseMarshall {
+public:
+	SymbolBaseMarshall(const DataOutputStreamSP& out): out_(out), complete_(false), nextStart_(0), partial_(0), dict_(0){}
+	~SymbolBaseMarshall(){}
+	bool start(const SymbolBaseSP target, bool blocking, IO_ERR& ret);
+	void reset();
+
+private:
+	BufferWriter<DataOutputStreamSP> out_;
+	SymbolBaseSP target_;
+	bool complete_;
+	int nextStart_;
+	int partial_;
+	char buf_[MARSHALL_BUFFER_SIZE];
+	int dict_;
+};
 
 class EXPORT_DECL ScalarMarshall: public ConstantMarshallImp{
 public:
 	ScalarMarshall(const DataOutputStreamSP& out):ConstantMarshallImp(out), partial_(0){}
 	virtual ~ScalarMarshall(){}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
 private:
 	int partial_;
@@ -78,13 +95,20 @@ class EXPORT_DECL VectorMarshall: public ConstantMarshallImp{
 public:
 	VectorMarshall(const DataOutputStreamSP& out):ConstantMarshallImp(out),nextStart_(0),partial_(0){}
 	virtual ~VectorMarshall(){}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
-	virtual bool start(const ConstantSP& target, bool blocking, IO_ERR& ret);
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
+	virtual bool start(const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
+	void resetSymbolBaseMarshall(bool createIfNotExist);
+	COMPRESS_METHOD getCompressMethod() { return compressMethod_; }
+	void setCompressMethod(COMPRESS_METHOD method) { compressMethod_ = method; }
 private:
+	bool writeMetaValues(BufferWriter<DataOutputStreamSP> &output, const ConstantSP& target, bool includeMeta,
+		size_t offset, bool blocking, IO_ERR& ret);
 	INDEX nextStart_;
 	int partial_;
 	ConstantMarshallSP marshall_;
+	SymbolBaseMarshallSP symbaseMarshall_;
+	COMPRESS_METHOD compressMethod_;
 };
 
 class EXPORT_DECL MatrixMarshall: public ConstantMarshallImp{
@@ -92,7 +116,7 @@ public:
 	MatrixMarshall(const DataOutputStreamSP& out) : ConstantMarshallImp(out), rowLabelSent_(false),
 		columnLabelSent_(false), inProgress_(false), vectorMarshall_(out){}
 	virtual ~MatrixMarshall(){}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
 private:
 	bool sendMeta(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
@@ -109,7 +133,7 @@ public:
 	TableMarshall(const DataOutputStreamSP& out) : ConstantMarshallImp(out) ,columnNamesSent_(0), nextColumn_(0),
 		columnInProgress_(false), vectorMarshall_(out){}
 	virtual ~TableMarshall(){}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
 private:
 	bool sendMeta(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
@@ -125,7 +149,7 @@ class EXPORT_DECL SetMarshall: public ConstantMarshallImp{
 public:
 	SetMarshall(const DataOutputStreamSP& out):ConstantMarshallImp(out), vectorMarshall_(out){}
 	virtual ~SetMarshall(){}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
 
 private:
@@ -140,7 +164,7 @@ public:
 	DictionaryMarshall(const DataOutputStreamSP& out):ConstantMarshallImp(out), keySent_(false),
 		inProgress_(false), vectorMarshall_(out){}
 	virtual ~DictionaryMarshall(){}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
 private:
 	bool sendMeta(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
@@ -155,7 +179,7 @@ class EXPORT_DECL ChunkMarshall: public ConstantMarshallImp{
 public:
 	ChunkMarshall(const DataOutputStreamSP& out):ConstantMarshallImp(out){}
 	virtual ~ChunkMarshall(){}
-	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
+	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
 };
 
@@ -195,7 +219,7 @@ public:
 	virtual ~VectorUnmarshall(){}
 	virtual bool start(short flag, bool blocking, IO_ERR& ret);
 	virtual void reset();
-	void resetSymbolBaseUnmarshall(bool createIfNotExist);
+	void resetSymbolBaseUnmarshall(DataInputStreamSP in, bool createIfNotExist);
 
 private:
 	short flag_;

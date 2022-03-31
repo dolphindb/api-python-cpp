@@ -72,7 +72,10 @@ if (WIN32)
 set(WIN32_LIBS 
 	libDolphinDBAPI.dll 
 	libgcc_s_seh-1.dll 
-	libstdc++-6.dll)
+	libstdc++-6.dll
+	ssleay32.dll
+	libeay32.dll
+	)
 
 foreach(file_i ${WIN32_LIBS})
 	add_custom_command(

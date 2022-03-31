@@ -1,6 +1,7 @@
 from pandas import DataFrame
 from dolphindb.vector import Vector
 from dolphindb.vector import FilterCond
+from dolphindb.settings import get_verbose
 import uuid
 import copy
 import numpy as np
@@ -47,16 +48,20 @@ class Counter(object):
 
 class Table(object):
     def __init__(self, dbPath=None, data=None, tableAliasName=None, partitions=None, inMem=False, schemaInited=False,
-                 s=None, needGC=True):
+                 s=None, needGC=True, isMaterialized=False):
         if partitions is None:
             partitions = []
         self.__having = None
         self.__top = None
         self.__exec = False
+        self.__limit = None
         self.__leftTable = None
         self.__rightTable = None
         self.__merge_for_update = False
         self.__objAddr = None
+        self.isMaterialized = isMaterialized
+        if tableAliasName is not None:
+            self.isMaterialized = True
         if s is None:
             raise RuntimeError("session must be provided")
         self.__tableName = _generate_tablename() if not isinstance(data, str) else data
@@ -107,6 +112,9 @@ class Table(object):
                 # self.__session.run(runstr)
             else:
                 pass
+        elif "orca.core.frame.DataFrame" in str(data.__class__):
+            df = s.run(data._var_name)
+            self.__init__(data=df, s=self.__session)
         else:
             raise RuntimeError("data must be a remote dolphindb table name or dict or DataFrame")
         self._init_schema()
@@ -115,6 +123,8 @@ class Table(object):
         if memodict is None:
             memodict = {}
         newTable = Table(data=self.__tableName, schemaInited=True, s=self.__session, needGC=self.__need_gc)
+        newTable._setExec(self.isExec)
+        newTable.isMaterialized = self.isMaterialized
         try:
             newTable.vecs = copy.deepcopy(self.vecs, memodict)
         except AttributeError:
@@ -160,6 +170,16 @@ class Table(object):
         except AttributeError:
             pass
 
+        try: 
+            newTable.__limit = copy.deepcopy(self.__limit, memodict)
+        except AttributeError:
+            pass
+
+        try:
+            newTable.__csort = copy.deepcopy(self.__csort, memodict)
+        except AttributeError:
+            pass
+
         try:
             if self.__need_gc:
                 newTable.__ref = self.__ref
@@ -171,6 +191,8 @@ class Table(object):
 
     def __copy__(self):
         newTable = Table(data=self.__tableName, schemaInited=True, s=self.__session, needGC=self.__need_gc)
+        newTable._setExec(self.isExec)
+        newTable.isMaterialized = self.isMaterialized
         try:
             newTable.vecs = copy.copy(self.vecs)
         except AttributeError:
@@ -217,6 +239,16 @@ class Table(object):
             pass
 
         try:
+            newTable.__limit = copy.copy(self.__limit)
+        except AttributeError:
+            pass
+
+        try:
+            newTable.__csort = copy.copy(self.__csort)
+        except AttributeError:
+            pass
+
+        try:
             if self.__need_gc:
                 newTable.__ref = self.__ref
                 self.__ref.inc()
@@ -230,10 +262,18 @@ class Table(object):
             if self.__ref.dec() == 0:
                 # print('do __del__')
                 try:
-                    if self.__objAddr is None or self.__objAddr < 0:
-                        self.__session.run('undef(`{})'.format(self.__tableName))
-                    else:
-                        self.__session.run('undef(`{}, VAR, {})'.format(self.__tableName, self.__objAddr))
+                    # this is not a real table name such as join table, no need to undef.
+                    if '(' in self.__tableName or ')' in self.__tableName:
+                        return
+                    #if self.__objAddr is None or self.__objAddr < 0:
+                    #    self.__session.run("undef('{}')".format(self.__tableName))
+                    #else:
+                    #    self.__session.run("undef('{}', VAR, {})".format(self.__tableName, self.__objAddr))
+                    if self.__session.isClosed() == False :
+                        if self.__objAddr is None or self.__objAddr < 0:
+                            self.__session.run("undef('{}')".format(self.__tableName))
+                        else:
+                            self.__session.run("undef('{}', VAR)".format(self.__tableName))
                 except Exception as e:
                     print("undef table '{}' got an exception: ".format(self.__tableName))
                     print(e)
@@ -314,14 +354,66 @@ class Table(object):
         else:
             self.__where.append(str(conds))
 
-    def _setSort(self, bys):
+    def _setSort(self, bys, ascending=True):
         if isinstance(bys, list) or isinstance(bys, tuple):
             self.__sort = [str(x) for x in bys]
         else:
             self.__sort = [str(bys)]
+        if (isinstance(ascending, list) or isinstance(ascending, tuple)) and (len(self.__sort) != len(ascending)):
+            raise ValueError(f"Length of ascending ({len(ascending)}) != length of bys ({len(self.__sort)})")
+        if len(self.__sort) > 1:
+            if isinstance(ascending, list) or isinstance(ascending, tuple):
+                tem = []
+                for i in range(len(self.__sort)):
+                    if(ascending[i] == False):
+                        tem.append(self.__sort[i] + " desc")
+                    else:
+                        tem.append(self.__sort[i])
+                self.__sort = tem
+            else:
+                if(ascending == False):
+                    tem = []          
+                    for x in self.__sort:
+                        tem.append(x + " desc")
+                    self.__sort = tem
+        elif len(self.__sort):
+            if(ascending == False):
+                self.__sort = [self.__sort[0] + " desc"]
 
     def _setTop(self, num):
         self.__top = str(num)
+
+    def _setCsort(self, bys, ascending=True):
+        if isinstance(bys, list) or isinstance(bys, tuple):
+            self.__csort = [str(x) for x in bys]
+        else:
+            self.__csort = [str(bys)]
+        if (isinstance(ascending, list) or isinstance(ascending, tuple)) and (len(self.__csort) != len(ascending)):
+            raise ValueError(f"Length of ascending ({len(ascending)}) != length of by ({len(self.__csort)})")
+        if len(self.__csort) > 1:
+            if isinstance(ascending, list) or isinstance(ascending, tuple):
+                tem = []
+                for i in range(len(self.__csort)):
+                    if(ascending[i] == False):
+                        tem.append(self.__csort[i] + " desc")
+                    else:
+                        tem.append(self.__csort[i])
+                self.__csort = tem
+            else:
+                if(ascending == False):
+                    tem = []          
+                    for x in self.__csort:
+                        tem.append(x + " desc")
+                    self.__csort = tem
+        elif len(self.__csort):
+            if(ascending == False):
+                self.__csort = [self.__csort[0] + " desc"]
+
+    def _setLimit(self, num):
+        if isinstance(num, list) or isinstance(num, tuple):
+            self.__limit = [str(x) for x in num]
+        else:
+            self.__limit = [str(num)]
 
     def _setWhere(self, where):
         self.__where = where
@@ -330,6 +422,18 @@ class Table(object):
         selectTable = copy.copy(self)
         # print("ref of newTable: ", selectTable.__ref.val(), " self.ref: ", self.__ref.val())
         selectTable._setSelect(cols)
+        if not self.isMaterialized:
+            selectTable.__tableName = f"({self.showSQL()})"
+        selectTable.isMaterialized = False
+        return selectTable
+
+    def exec(self, cols):
+        selectTable = copy.copy(self)
+        selectTable._setSelect(cols)
+        selectTable._setExec(True)
+        if not self.isMaterialized:
+            selectTable.__tableName = f"({self.showSQL()})"
+        selectTable.isMaterialized = False
         return selectTable
 
     def where(self, conds):
@@ -366,15 +470,25 @@ class Table(object):
         contextbyTable._setContextby(contextby)
         return contextby
 
-    def sort(self, bys):
+    def sort(self, bys, ascending=True):
         sortTable = copy.copy(self)
-        sortTable._setSort(bys)
+        sortTable._setSort(bys, ascending)
         return sortTable
 
     def top(self, num):
         topTable = copy.copy(self)
         topTable._setTop(num)
         return topTable
+
+    def csort(self, bys, ascending=True):
+        csortTable = copy.copy(self)
+        csortTable._setCsort(bys, ascending)
+        return csortTable
+
+    def limit(self, num):
+        limitTable = copy.copy(self)
+        limitTable._setLimit(num)
+        return limitTable
 
     def execute(self, expr):
         if expr:
@@ -423,7 +537,14 @@ class Table(object):
     def setMergeForUpdate(self, toUpdate):
         self.__merge_for_update = toUpdate
 
-    def pivotby(self, index, column, value, aggFunc=None):
+    @property
+    def isExec(self):
+        return self.__exec
+
+    def _setExec(self, isExec):
+        self.__exec = isExec
+
+    def pivotby(self, index, column, value=None, aggFunc=None):
         """
         create a pivot table.
         see www.dolphindb.com/help/pivotby.html
@@ -438,6 +559,7 @@ class Table(object):
         return TablePivotBy(pivotByTable, index, column, value, aggFunc)
 
     def merge(self, right, how='inner', on=None, left_on=None, right_on=None, sort=False, merge_for_update=False):
+        # TODO: update comment
         """
         Merge two tables using ANSI SQL style join semantics.
 
@@ -447,6 +569,7 @@ class Table(object):
             right: see http://www.dolphindb.com/help/index.html?leftjoin.html
             outer: see http://www.dolphindb.com/help/index.html?fulljoin.html
             inner: see http://www.dolphindb.com/help/index.html?equaljoin.html
+            left semi: see https://www.dolphindb.com/help/SQLStatements/TableJoiners/leftjoin.html?highlight=lsj
         :param on: column or list of columns
             columns to join on, must be present on both tables.
         :param left_on: column or list of columns
@@ -459,11 +582,21 @@ class Table(object):
         howMap = {'inner': 'ej',
                   'left': 'lj',
                   'right': 'lj',
-                  'outer': 'fj'}
+                  'outer': 'fj',
+                  'left semi': 'lsj'}
         joinFunc = howMap[how]
         joinFuncPrefix = '' if sort is False or joinFunc == 'fj' else 's'
-        leftTableName = self.tableName()
-        rightTableName = right.tableName() if isinstance(right, Table) else right
+
+        if self.isMaterialized:
+            leftTableName = self.tableName()
+        else:
+            leftTableName = f"({self.showSQL()})"
+
+        if right.isMaterialized:
+            rightTableName = right.tableName() if isinstance(right, Table) else right
+        else:
+            rightTableName = f"({right.showSQL()})"
+
         if how == 'right':
             leftTableName, rightTableName = rightTableName, leftTableName
             left_on, right_on = right_on, left_on
@@ -511,6 +644,7 @@ class Table(object):
         joinTable._setSelect('*')
         if merge_for_update:
             joinTable.setMergeForUpdate(True)
+        joinTable.isMaterialized = False
         return joinTable
 
     def merge_asof(self, right, on=None, left_on=None, right_on=None):
@@ -527,9 +661,15 @@ class Table(object):
             right table columns to join on, default to on if None
         :return: merged Table object
         """
+        if self.isMaterialized:
+            leftTableName = self.tableName()
+        else:
+            leftTableName = f"({self.showSQL()})"
 
-        leftTableName = self.tableName()
-        rightTableName = right.tableName() if isinstance(right, Table) else right
+        if right.isMaterialized:
+            rightTableName = right.tableName() if isinstance(right, Table) else right
+        else:
+            rightTableName = f"({right.showSQL()})"
 
         if on is not None and not isinstance(on, list) and not isinstance(on, tuple):
             on = [on]
@@ -568,6 +708,7 @@ class Table(object):
         joinTable._setTableName(finalTableName)
         joinTable._setSelect('*')
         # joinTable._setSelect(leftSelectCols + rightSelectCols)
+        joinTable.isMaterialized = False
         return joinTable
 
     def merge_window(self, right, leftBound=None, rightBound=None, aggFunctions=None, on=None, left_on=None,
@@ -691,21 +832,44 @@ class Table(object):
         except AttributeError:
             return ''
 
+    def _assembleCsort(self):
+        try:
+            return 'csort ' + ','.join(self.__csort)
+        except AttributeError:
+            return ''
+    
+    def _assembleLimit(self):
+        try:
+            if (self.__limit is None):
+                return ''
+            if len(self.__limit) and isinstance(self.__limit, list):
+                return 'limit ' + ','.join(self.__limit)
+            else:
+                return self.__limit
+        except AttributeError:
+            return ''
+
     def showSQL(self):
         import re
-        queryFmt = 'select {top} {select} from {table} {where} {groupby} {having} {orderby}'
+        selectOrExec = "exec" if self.isExec else "select"
+        queryFmt = selectOrExec + ' {top} {select} from {table} {where} {groupby} {csort} {having} {orderby} {limit}'
         fmtDict = {}
         fmtDict['top'] = ("top " + self.__top) if self.__top else ''
         fmtDict['select'] = self._assembleSelect()
         fmtDict['table'] = self.tableName()
         fmtDict['where'] = self._assembleWhere()
         fmtDict['groupby'] = self._assembleGroupbyOrContextby()
+        fmtDict['csort'] = self._assembleCsort()
         fmtDict['having'] = ("having " + self.__having) if self.__having else ''
         fmtDict['orderby'] = self._assembleOrderby()
+        fmtDict['limit'] = self._assembleLimit()
         query = re.sub(' +', ' ', queryFmt.format(**fmtDict).strip())
         # print(query)
         # if(self.__tableName.startswith("wj") or self.__tableName.startswith("pwj")):
         #     return self.__tableName
+
+        if get_verbose():
+            print(query)
         return query
 
     def append(self, table):
@@ -950,6 +1114,8 @@ class TableUpdate(object):
             else:
                 fmtDict['having'] = ""
             query = re.sub(' +', ' ', queryFmt.format(**fmtDict).strip())
+            if get_verbose():
+                print(query)
             return query
         else:
             if self.__t.getLeftTable() is None:
@@ -970,6 +1136,8 @@ class TableUpdate(object):
                 fmtDict['having'] = ""
             query = re.sub(' +', ' ', queryFmt.format(**fmtDict).strip())
             self.__t.setMergeForUpdate(False)
+            if get_verbose():
+                print(query)
             return query
 
     def execute(self):
@@ -995,7 +1163,7 @@ class TableUpdate(object):
 
 
 class TablePivotBy(object):
-    def __init__(self, t, index, column, value, agg=None):
+    def __init__(self, t, index, column, value=None, agg=None):
         self.__row = index
         self.__column = column
         self.__val = value
@@ -1008,7 +1176,8 @@ class TablePivotBy(object):
         :return: query result as a pandas.DataFrame object
         """
         query = self.showSQL()
-
+        if get_verbose():
+            print(query)
         df = self.__t.session().run(query)  # type: DataFrame
 
         return df
@@ -1016,7 +1185,12 @@ class TablePivotBy(object):
     toDataFrame = toDF
 
     def _assembleSelect(self):
-        return self.__val if self.__agg is None else _getFuncName(self.__agg) + '(' + self.__val + ')'
+        if self.__val is not None:
+            return self.__val if self.__agg is None else _getFuncName(self.__agg) + '(' + self.__val + ')'
+        return None
+
+    def _assembleTableSelect(self):
+        return self.__t._assembleSelect()
 
     def _assembleWhere(self):
         return self.__t._assembleWhere()
@@ -1030,10 +1204,14 @@ class TablePivotBy(object):
 
     def showSQL(self):
         import re
-        queryFmt = 'select {select} from {table} {where} {pivotby}'
+        selectOrExec = "exec" if self.__t.isExec else "select"
+        queryFmt = selectOrExec + ' {select} from {table} {where} {pivotby}'
         fmtDict = {}
-
-        fmtDict['select'] = self._assembleSelect()
+        select = self._assembleSelect()
+        if select is not None:
+            fmtDict['select'] = select
+        else:
+            fmtDict['select'] = self._assembleTableSelect()
         fmtDict['table'] = self.__t.tableName()
         fmtDict['where'] = self._assembleWhere()
         fmtDict['pivotby'] = self._assemblePivotBy()
@@ -1057,10 +1235,15 @@ class TableGroupby(object):
         self.__having = having
         self.__t = t  # type: Table
 
-    def sort(self, bys):
+    def sort(self, bys, ascending=True):
         sortTable = copy.copy(self.__t)
-        sortTable._setSort(bys)
+        sortTable._setSort(bys, ascending)
         return TableGroupby(sortTable, self.__groupBys, self.__having)
+
+    def csort(self, bys, ascending=True):
+        csortTable = copy.copy(self.__t)
+        csortTable._setCsort(bys, ascending)
+        return TableGroupby(csortTable, self.__groupBys, self.__having)
 
     def executeAs(self, newTableName):
         st = newTableName + "=" + self.showSQL()
@@ -1220,10 +1403,15 @@ class TableContextby(object):
         self.__t = t  # type: Table
         self.__having = having
 
-    def sort(self, bys):
+    def sort(self, bys, ascending=True):
         sortTable = copy.copy(self.__t)
-        sortTable._setSort(bys)
+        sortTable._setSort(bys, ascending)
         return TableContextby(sortTable, self.__contextBys)
+
+    def csort(self, bys, ascending=True):
+        csortTable = copy.copy(self.__t)
+        csortTable._setCsort(bys, ascending)
+        return TableContextby(csortTable, self.__contextBys)
 
     def having(self, expr):
         havingTable = copy.copy(self.__t)
@@ -1259,6 +1447,9 @@ class TableContextby(object):
 
     def top(self, num):
         return self.__t.top(num=num)
+
+    def limit(self, num):
+        return self.__t.limit(num=num)
 
     def having(self, expr):
         havingTable = copy.copy(self.__t)

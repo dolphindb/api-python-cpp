@@ -48,3 +48,8 @@ You can build this only in windows for now.
 
 Output wheels will be located at `wheelhouse` directory too.
 
+## Upload to pypi.org
+
+```cmd
+$ C:Python37\python.exe -m twine upload -u dolphindbpy -p DBpy@3817 .\wheelhouse\*`
+```

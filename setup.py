@@ -59,6 +59,8 @@ class CMakeBuild(build_ext):
                 cmake_args += ['-DPICKLEAPI_LIBDIR=python3.7']
             if sys.version_info[1] == 8:
                 cmake_args += ['-DPICKLEAPI_LIBDIR=python3.8']
+            if sys.version_info[1] == 9:
+                cmake_args += ['-DPICKLEAPI_LIBDIR=python3.9']
             # if sys.maxsize > 2 ** 32:
                 # cmake_args += ['-A', 'x64']
             build_args += ['--', '-j']
@@ -74,6 +76,8 @@ class CMakeBuild(build_ext):
                 cmake_args += ['-DPICKLEAPI_LIBDIR=python3.7']
             if sys.version_info[1] == 8:
                 cmake_args += ['-DPICKLEAPI_LIBDIR=python3.8']
+            if sys.version_info[1] == 9:
+                cmake_args += ['-DPICKLEAPI_LIBDIR=python3.9']
             build_args += ['--', '-j']
         env = os.environ.copy()
         env['CXXFLAGS'] = '{} -DVERSION_INFO=\\"{}\\"'.format(
@@ -98,6 +102,7 @@ with open("README.md", "r") as f:
     long_description = f.read()
 
 old_packages = setuptools.find_packages('src')
+print("find_packages : ",len(old_packages))
 packages = []
 packages_dir = {'': 'src'}
 isPy2 = sys.version_info[0] < 3
@@ -112,7 +117,7 @@ for pkg_name in old_packages:
     packages.append(pkg_name)
 
 setuptools.setup(name='dolphindb',
-                 version='1.30.0.10',
+                 version='1.30.16.1',
                  install_requires=[
                      "future",
                      "numpy>=1.18,<=1.19.3",

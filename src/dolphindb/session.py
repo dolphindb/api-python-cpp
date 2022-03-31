@@ -14,10 +14,11 @@ import sys
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-
+import warnings
+warnings.filterwarnings('ignore',category=FutureWarning)
 sys.path.append(os.path.dirname(__file__))
-
 import dolphindbcpp  as ddbcpp
+
 
 def _generate_tablename():
     return "TMP_TBL_" + uuid.uuid4().hex[:8]
@@ -31,8 +32,8 @@ def start_thread_loop(loop):
     loop.run_forever()
 
 class DBConnectionPool(object):
-    def __init__(self, host, port, threadNum=10, userid="", password="", loadBalance=False, highAvailability=False, reConnectFlag=True):
-        self.pool = ddbcpp.dbConnectionPoolImpl(host, port, threadNum, userid, password, loadBalance, highAvailability, reConnectFlag)
+    def __init__(self, host, port, threadNum=10, userid="", password="", loadBalance=False, highAvailability=False, reConnectFlag=True,compress=False):
+        self.pool = ddbcpp.dbConnectionPoolImpl(host, port, threadNum, userid, password, loadBalance, highAvailability, reConnectFlag,compress)
         self.host = host
         self.port = port
         self.userid = userid
@@ -97,6 +98,9 @@ class DBConnectionPool(object):
         self.pool = None
         self.loop = None
         self.thread = None
+
+    def getSessionId(self):
+        return self.pool.getSessionId()
         
 
 class session(object):
@@ -109,21 +113,25 @@ class session(object):
     3: Table object returns  a pandas data frame
     4: Matrix object returns a numpy array
     """
-    def __init__(self, host=None, port=None, userid="", password="",enableSSL=False, enableASYN=False):
-        self.cpp = ddbcpp.sessionimpl(enableSSL,enableASYN)
+    def __init__(self, host=None, port=None, userid="", password="",enableSSL=False, enableASYN=False, keepAliveTime=30, enableChunkGranularitConfig=False,compress=False, enablePickle=True):
+        self.cpp = ddbcpp.sessionimpl(enableSSL, enableASYN, keepAliveTime,compress,enablePickle)
         self.host = host
         self.port = port
         self.userid = userid
         self.password=password
         self.mutex = Lock()
         self.enableEncryption = True
+        self.enableChunkGranularitConfig = enableChunkGranularitConfig
+        self.enablePickle = enablePickle
         if self.host is not None and self.port is not None:
             self.connect(host, port, userid, password)
 
-    def connect(self, host, port, userid="", password="", startup="", highAvailability=False, highAvailabilitySites=None):
+    def connect(self, host, port, userid="", password="", startup="", highAvailability=False, highAvailabilitySites=None, keepAliveTime=None):
         if highAvailabilitySites is None:
             highAvailabilitySites = []
-        return self.cpp.connect(host, port, userid, password, startup, highAvailability, highAvailabilitySites)
+        if keepAliveTime is None:
+            keepAliveTime = -1
+        return self.cpp.connect(host, port, userid, password, startup, highAvailability, highAvailabilitySites, keepAliveTime)
 
     def login(self,userid, password, enableEncryption=True):
         self.mutex.acquire()
@@ -139,6 +147,9 @@ class session(object):
         self.host = None
         self.port = None
         self.cpp.close()
+    
+    def isClosed(self):
+        return self.host is None
 
     def upload(self, nameObjectDict):
         return self.cpp.upload(nameObjectDict)
@@ -146,8 +157,16 @@ class session(object):
     def run(self, script, *args, **kwargs):
         if(kwargs):
             if "fetchSize" in kwargs.keys():
-                return self.cpp.runBlock(script, **kwargs)
+                return BlockReader(self.cpp.runBlock(script, **kwargs))
         return self.cpp.run(script, *args, **kwargs)
+    
+    def runFile(self, filepath, *args, **kwargs):
+        with open(filepath, "r") as fp:
+            script = fp.read()
+            return self.run(script, *args, **kwargs)
+
+    def getSessionId(self):
+        return self.cpp.getSessionId()
 
     def nullValueToZero(self):
         self.cpp.nullValueToZero()
@@ -155,8 +174,8 @@ class session(object):
     def nullValueToNan(self):
         self.cpp.nullValueToNan()
 
-    def enableStreaming(self, port):
-        self.cpp.enableStreaming(port)
+    def enableStreaming(self, port, threadCount = 1):
+        self.cpp.enableStreaming(port,threadCount)
 
     def subscribe(self, host, port, handler, tableName, actionName="", offset=-1, resub=False, filter=None, msgAsTable=False, batchSize=0, throttle=1):
         if filter is None:
@@ -196,13 +215,13 @@ class session(object):
         tableName = _generate_tablename()
         runstr = tableName + '=loadText("' + remoteFilePath + '","' + delimiter + '")'
         self.run(runstr)
-        return Table(data=tableName, s=self)
+        return Table(data=tableName, s=self, isMaterialized=True)
 
     def ploadText(self, remoteFilePath=None, delimiter=","):
         tableName = _generate_tablename()
         runstr = tableName + '= ploadText("' + remoteFilePath + '","' + delimiter + '")'
         self.run(runstr)
-        return Table(data=tableName, s=self)
+        return Table(data=tableName, s=self, isMaterialized=True)
 
     def loadTable(self,tableName,  dbPath=None, partitions=None, memoryMode=False):
         """
@@ -259,9 +278,9 @@ class session(object):
             fmtDict['inMem'] = str(memoryMode).lower()
             runstr = re.sub(' +', ' ', runstr.format(**fmtDict).strip())
             self.run(runstr)
-            return Table(data=tbName, s=self)
+            return Table(data=tbName, s=self, isMaterialized=True)
         else:
-            return Table(data=tableName, s=self, needGC=False)
+            return Table(data=tableName, s=self, needGC=False, isMaterialized=True)
 
     def loadTableBySQL(self, tableName, dbPath, sql):
         """
@@ -272,16 +291,13 @@ class session(object):
         """
         # loadTableBySQL
         runstr = 'db=database("' + dbPath + '")'
-        # print(runstr)
         self.run(runstr)
         runstr = tableName + '= db.loadTable("%s")' % tableName
-        # print(runstr)
         self.run(runstr)
-        runstr = tableName + "=loadTableBySQL(<%s>)" % sql
-        # runstr =  sql
-        # print(runstr)
+        tmpTableName = _generate_tablename()
+        runstr = tmpTableName + "=loadTableBySQL(<%s>)" % sql
         self.run(runstr)
-        return Table(data=tableName, s=self)
+        return Table(data=tmpTableName, s=self, isMaterialized=True)
 
     def convertDatetime64(self, datetime64List):
         l = len(str(datetime64List[0]))
@@ -319,7 +335,7 @@ class session(object):
         listStr += ']'
         return listStr
 
-    def database(self,dbName=None, partitionType=None, partitions=None, dbPath=None):
+    def database(self,dbName=None, partitionType=None, partitions=None, dbPath=None, engine=None, atomic=None, chunkGranularity=None):
         """
 
         :param dbName: database variable Name on DolphinDB Server
@@ -368,14 +384,23 @@ class session(object):
 
         if partitionType:
             if dbPath:
-                dbstr =  dbName + '=database("'+dbPath+'",' + str(partitionType) + "," + partition_str + ")"
+                dbstr =  dbName + '=database("'+dbPath+'",' + str(partitionType) + "," + partition_str
             else:
-                dbstr =  dbName +'=database("",' + str(partitionType) + "," + partition_str + ")"
+                dbstr =  dbName +'=database("",' + str(partitionType) + "," + partition_str
         else:
             if dbPath:
-                dbstr =  dbName +'=database("' + dbPath + '")'
+                dbstr =  dbName +'=database("' + dbPath + '"'
             else:
-                dbstr =  dbName +'=database("")'
+                dbstr =  dbName +'=database(""'
+        
+        if engine is not None:
+            dbstr += ",engine='"+engine+"'"
+        if atomic is not None:
+            dbstr += ",atomic='"+atomic+"'"
+        if self.enableChunkGranularitConfig == True :
+            dbstr += ",chunkGranularity='"+chunkGranularity+"'"
+        
+        dbstr+=")"
 
         self.run(dbstr)
         return Database(dbName=dbName, s=self)
@@ -428,7 +453,6 @@ class session(object):
         isDBPath = True
         if "/" in dbPath or "\\" in dbPath or "dfs://" in dbPath:
             dbstr ='db=database("' + dbPath + '")'
-        # print(dbstr)
             self.run(dbstr)
             tbl_str = '{tableNameNEW} = loadTextEx(db, "{tableName}", {partitionColumns}, "{remoteFilePath}", {delimiter})'
         else:
@@ -483,8 +507,8 @@ class session(object):
     
 
 class BlockReader(object):
-    def __init__(self):
-        self.block = ddbcpp.blockReader()
+    def __init__(self, blockReader):
+        self.block = blockReader
     def read(self): 
         return self.block.read()
     def hasNext(self):
