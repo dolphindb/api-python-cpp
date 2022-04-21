@@ -1,0 +1,5 @@
+cp ./libDolphinDBAPI.a ../../api-python-cpp/pickleAPI/bin/linux_x64/python3.6
+cp ./libDolphinDBAPI.a ../../api-python-cpp/pickleAPI/bin/linux_x64/python3.7
+cp ./libDolphinDBAPI.a ../../api-python-cpp/pickleAPI/bin/linux_x64/python3.8
+cp ./libDolphinDBAPI.a ../../api-python-cpp/pickleAPI/bin/linux_x64/python3.9
+cp ../src/*.h ../../api-python-cpp/pickleAPI/include

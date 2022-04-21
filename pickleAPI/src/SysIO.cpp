@@ -33,8 +33,8 @@
 
 namespace dolphindb {
 
-#define RECORD_READ(pbytes, bytelen) //Util::writeFile("/tmp/ioRead.bin", pbytes, bytelen);
-#define RECORD_WRITE(pbytes, bytelen) //Util::writeFile("/tmp/ioWrite.bin", pbytes, bytelen);
+#define RECORD_READ(pbytes, bytelen) //Util::writeFile("/tmp/ddb_read.bin", pbytes, bytelen);
+#define RECORD_WRITE(pbytes, bytelen) //Util::writeFile("/tmp/ddb_write.bin", pbytes, bytelen);
 
 bool Socket::ENABLE_TCP_NODELAY = true;
 
@@ -101,50 +101,61 @@ bool Socket::isValid(){
 
 IO_ERR Socket::read(char* buffer, size_t length, size_t& actualLength, bool msgPeek){
 	//RecordTime record("Socket.read");
-#ifdef WINDOWS
-	actualLength=recv(handle_, buffer, length, msgPeek ? MSG_PEEK : 0);
-	if(actualLength == 0)
-		return DISCONNECTED;
-	else if(actualLength != (size_t)SOCKET_ERROR)
-		return OK;
-	else{
-		actualLength=0;
-		int error=WSAGetLastError();
-		if(error==WSAENOTCONN || error==WSAESHUTDOWN || error==WSAENETRESET)
-			return DISCONNECTED;
-		else if(error==WSAEWOULDBLOCK)
-			return NODATA;
-		else
-			return OTHERERR;
-	}
-#else
-	readdata:
 	if (!enableSSL_) {
-         actualLength=recv(handle_, (void*)buffer, length, (blocking_ ? 0 : MSG_DONTWAIT) | (msgPeek ? MSG_PEEK : 0));
-		 RECORD_READ(buffer, actualLength);
-                if(actualLength == (size_t)SOCKET_ERROR && errno == EINTR) goto readdata;
-                if(actualLength == 0)
-                        return DISCONNECTED;
-                else if(actualLength != (size_t)SOCKET_ERROR)
-                        return OK;
-                else if(errno==EAGAIN || errno==EWOULDBLOCK)
-                        return NODATA;
-                else{
-                        actualLength=0;
-                        return OTHERERR;
-                }
-        }else {
-                actualLength = SSL_read(ssl_, buffer, length);
-				RECORD_READ(buffer, actualLength);
-                if(actualLength <= 0){
-                int err = SSL_get_error(ssl_, actualLength);
-                if(err == SSL_ERROR_WANT_READ) goto readdata;
-                    LOG_ERR("Socket(SSL)::read err =" + std::to_string(err));
-                    return OTHERERR;
-                }
-                return OK;
+#ifdef WINDOWS
+		actualLength = recv(handle_, buffer, length, msgPeek ? MSG_PEEK : 0);
+		RECORD_READ(buffer, actualLength);
+		if (actualLength <= 0) {
+			DLogger::Error("socket read error", actualLength);
+		}
+		if (actualLength == 0)
+			return DISCONNECTED;
+		else if (actualLength != (size_t)SOCKET_ERROR)
+			return OK;
+		else {
+			actualLength = 0;
+			int error = WSAGetLastError();
+			if (error == WSAENOTCONN || error == WSAESHUTDOWN || error == WSAENETRESET)
+				return DISCONNECTED;
+			else if (error == WSAEWOULDBLOCK)
+				return NODATA;
+			else
+				return OTHERERR;
+		}
+#else //Linux
+readdata:
+		actualLength = recv(handle_, (void*)buffer, length, (blocking_ ? 0 : MSG_DONTWAIT) | (msgPeek ? MSG_PEEK : 0));
+		RECORD_READ(buffer, actualLength);
+		if (actualLength <= 0) {
+			DLogger::Error("socket read error", actualLength);
+		}
+		if (actualLength == (size_t)SOCKET_ERROR && errno == EINTR) goto readdata;
+		if (actualLength == 0)
+			return DISCONNECTED;
+		else if (actualLength != (size_t)SOCKET_ERROR)
+			return OK;
+		else if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return NODATA;
+		else {
+			actualLength = 0;
+			return OTHERERR;
+		}
+#endif// end of enableSSL_=false
+	} else {
+readdata2:
+        actualLength = SSL_read(ssl_, buffer, length);
+		RECORD_READ(buffer, actualLength);
+		if (actualLength <= 0) {
+			DLogger::Error("socket read error", actualLength);
+		}
+        if(actualLength <= 0){
+        int err = SSL_get_error(ssl_, actualLength);
+        if(err == SSL_ERROR_WANT_READ) goto readdata2;
+            LOG_ERR("Socket(SSL)::read err =" + std::to_string(err));
+            return OTHERERR;
         }
-#endif
+        return OK;
+    }
 }
 
 IO_ERR Socket::write(const char* buffer, size_t length, size_t& actualLength){
@@ -152,11 +163,13 @@ IO_ERR Socket::write(const char* buffer, size_t length, size_t& actualLength){
 	if(!enableSSL_){
 #ifdef WINDOWS
 		actualLength=send(handle_, buffer, length, 0);
+		RECORD_WRITE(buffer, actualLength);
 		if(actualLength != (size_t)SOCKET_ERROR)
 			return OK;
 		else{
 			actualLength=0;
 			int error=WSAGetLastError();
+			DLogger::Error("socket write error", error);
 			if(error==WSAENOTCONN || error==WSAESHUTDOWN || error==WSAENETRESET)
 				return DISCONNECTED;
 			else if(error==WSAEWOULDBLOCK || error==WSAENOBUFS)
@@ -175,6 +188,7 @@ IO_ERR Socket::write(const char* buffer, size_t length, size_t& actualLength){
 		if(actualLength != (size_t)SOCKET_ERROR)
 			return OK;
 		else{
+			DLogger::Error("socket write error", errno);
 			actualLength=0;
 			if(errno==EAGAIN || errno==EWOULDBLOCK)
 				return NOSPACE;
@@ -194,6 +208,7 @@ IO_ERR Socket::write(const char* buffer, size_t length, size_t& actualLength){
 		if (actualLength <= 0) {
 			int err = SSL_get_error(ssl_, actualLength);
 			if (err == SSL_ERROR_WANT_WRITE) goto senddata2;
+			DLogger::Error("socket write error", err);
 			LOG_ERR("Socket(SSL)::write err =" + std::to_string(err));
 			return OTHERERR;
 		}
@@ -1120,11 +1135,13 @@ IO_ERR DataOutputStream::write(const char* buffer, size_t length, size_t& actual
 
 	case ARRAY_STREAM:
 		if(size_ + length > capacity_){
-			if(capacity_ >= MAX_ARRAY_BUFFER)
-				return TOO_LARGE_DATA;
+			//if(capacity_ >= MAX_ARRAY_BUFFER)
+			//	return TOO_LARGE_DATA;
 			char* tmp = buf_;
 			size_t newCapacity = (std::max)(size_ + length, 2 * capacity_);
 			buf_ = new char[newCapacity];
+			if(buf_ == NULL)
+				return TOO_LARGE_DATA;
 			capacity_ = newCapacity;
 			memcpy(buf_, tmp, size_);
 			delete[] tmp;
@@ -1185,11 +1202,13 @@ IO_ERR DataOutputStream::write(const char* buffer, size_t length){
 
 	case ARRAY_STREAM:
 		if(size_ + length > capacity_){
-			if(capacity_ >= MAX_ARRAY_BUFFER)
-				return TOO_LARGE_DATA;
+			//if(capacity_ >= MAX_ARRAY_BUFFER)
+			//	return TOO_LARGE_DATA;
 			char* tmp = buf_;
 			size_t newCapacity = (std::max)(size_ + length, 2 * capacity_);
 			buf_ = new char[newCapacity];
+			if(buf_ == NULL)
+				return TOO_LARGE_DATA;
 			capacity_ = newCapacity;
 			memcpy(buf_, tmp, size_);
 			delete[] tmp;
@@ -1544,11 +1563,13 @@ string DataStream::getDescription() const {
 IO_ERR Buffer::write(const char* buffer, int length, int& actualLength){
 	actualLength = 0;
 	if(size_ + length > capacity_){
-		if(external_ || capacity_ >= MAX_ARRAY_BUFFER)
-			return TOO_LARGE_DATA;
+		//if(external_ || capacity_ >= MAX_ARRAY_BUFFER)
+		//	return TOO_LARGE_DATA;
 		char* tmp = buf_;
 		size_t newCapacity = (std::max)(size_ + length, 2 * capacity_);
 		buf_ = new char[newCapacity];
+		if(buf_ == NULL)
+			return TOO_LARGE_DATA;
 		capacity_ = newCapacity;
 		memcpy(buf_, tmp, size_);
 		delete[] tmp;
@@ -1561,11 +1582,13 @@ IO_ERR Buffer::write(const char* buffer, int length, int& actualLength){
 
 IO_ERR Buffer::write(const char* buffer, int length){
 	if(size_ + length > capacity_){
-		if(external_ || capacity_ >= MAX_ARRAY_BUFFER)
-			return TOO_LARGE_DATA;
+		//if(external_ || capacity_ >= MAX_ARRAY_BUFFER)
+		//	return TOO_LARGE_DATA;
 		char* tmp = buf_;
 		size_t newCapacity = (std::max)(size_ + length, 2 * capacity_);
 		buf_ = new char[newCapacity];
+		if(buf_ == NULL)
+			return TOO_LARGE_DATA;
 		capacity_ = newCapacity;
 		memcpy(buf_, tmp, size_);
 		delete[] tmp;

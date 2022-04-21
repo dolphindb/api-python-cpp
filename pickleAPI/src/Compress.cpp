@@ -589,8 +589,12 @@ IO_ERR CompressDeltaofDelta::decode(DataInputStreamSP compressSrc, DataOutputStr
 	CheckSum checkSum;
 
 	BufferWriter<DataOutputStreamSP> out(decompressResult);
-	out.start((char*)&(header.elementCount), sizeof(header.elementCount));
-	out.start((char*)&(header.colCount), sizeof(header.elementCount));
+	ret = out.start((char*)&(header.elementCount), sizeof(header.elementCount));
+	if (ret != OK)
+		return ret;
+	ret = out.start((char*)&(header.colCount), sizeof(header.elementCount));
+	if (ret != OK)
+		return ret;
 	while (fileCursor < byteSize && start < len) {
 		ret = compressSrc->readInt(blockSize);
 		if (ret != OK)
@@ -646,12 +650,16 @@ IO_ERR CompressDeltaofDelta::decode(DataInputStreamSP compressSrc, DataOutputStr
 			return INVALIDDATA;
 		}
 		count = actualRead;
-		out.start(decompressedBuf, count*unitLength);
+		ret = out.start(decompressedBuf, count*unitLength);
+		if (ret != OK)
+			return ret;
 		start += count;
 
 		if (containLSN && fileCursor + 8 <= byteSize) {
 			fileCursor += 8;
 			ret = compressSrc->readLong(lsn);
+			if (ret != OK)
+				return ret;
 			if (calcChecksum)
 				cksum = checkSum.crc32(cksum, (const unsigned char*)&lsn, sizeof(long long));
 		}
@@ -780,8 +788,12 @@ IO_ERR CompressLZ4::decode(DataInputStreamSP compressSrc, DataOutputStreamSP &un
 	
 	int pattial = 0;
 	BufferWriter<DataOutputStreamSP> out(uncompressResult);
-	out.start((char*)&(header.elementCount), sizeof(header.elementCount));
-	out.start((char*)&(header.colCount), sizeof(header.elementCount));
+	ret = out.start((char*)&(header.elementCount), sizeof(header.elementCount));
+	if (ret != OK)
+		return ret;
+	ret = out.start((char*)&(header.colCount), sizeof(header.colCount));
+	if (ret != OK)
+		return ret;
 	while (fileCursor < byteSize && start < len) {
 		ret = compressSrc->readInt(blockSize);
 		if (ret != OK)
@@ -823,7 +835,9 @@ IO_ERR CompressLZ4::decode(DataInputStreamSP compressSrc, DataOutputStreamSP &un
 				return INVALIDDATA;
 			}
 			count = bytes / unitLength;
-			out.start(decompressedBuf,count*unitLength);
+			ret = out.start(decompressedBuf,count*unitLength);
+			if (ret != OK)
+				return ret;
 			start += count;
 		}
 		else{
@@ -843,14 +857,18 @@ IO_ERR CompressLZ4::decode(DataInputStreamSP compressSrc, DataOutputStreamSP &un
 					count = len - start;
 					done = true;	
 				}
-				out.start(decompressedBuf, count*unitLength);
+				ret = out.start(decompressedBuf, count*unitLength);
+				if (ret != OK)
+					return ret;
 				start += count;
 				if (done) {
 					return OK;
 				}
 			}
 			else {
-				ret = uncompressResult->write(decompressedBuf, bytes);
+				ret = out.start(decompressedBuf, bytes);
+				if (ret != OK)
+					return ret;
 			}
 		}
 	}
@@ -899,6 +917,7 @@ IO_ERR CompressLZ4::encodeContent(const VectorSP &vec, const DataOutputStreamSP 
 				}
 				if (ret != OK)
 					return ret;
+				
 				blockSize = LZ4_compress_default(decompressedBuf, blockBuf + sizeof(int), decompressedBufSize, MAX_COMPRESSED_SIZE);
 				
 				if (lsnFlag && (start + count >= len)) {
@@ -907,9 +926,12 @@ IO_ERR CompressLZ4::encodeContent(const VectorSP &vec, const DataOutputStreamSP 
 				}
 				else
 					memcpy(blockBuf, (char*)&blockSize, sizeof(int));
+				blockSize += sizeof(int);
+
 				if (needcheckSum)
 					cksum = checkSum.crc32(cksum, (const unsigned char*)blockBuf, blockSize);
-				compressedbyteSize += blockSize + sizeof(int);
+				
+				compressedbyteSize += blockSize;
 				start += count;
 				blockBufList.push_back(blockBuf);
 				blockSizeList.push_back(blockSize);
@@ -930,7 +952,7 @@ IO_ERR CompressLZ4::encodeContent(const VectorSP &vec, const DataOutputStreamSP 
 		if (ret != OK)
 			return ret;
 		for (int i = 0; i < blockBufList.size(); i++) {
-			ret = out.start(blockBufList[i], blockSizeList[i] + sizeof(int));
+			ret = out.start(blockBufList[i], blockSizeList[i]);
 			//delete[] blockBufList[i];
 			if (ret != OK)
 				return ret;

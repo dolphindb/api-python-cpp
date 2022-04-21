@@ -6,6 +6,7 @@
 #include "ScalarImp.h"
 #include "Util.h"
 #include "Pickle.h"
+#include "MultithreadedTableWriter.h"
 
 namespace dolphindb {
 
@@ -16,7 +17,8 @@ const py::object Preserved::datetime64_ = numpy_.attr("datetime64");
 const py::object Preserved::pandas_ = py::module::import("pandas");
 //const std::string Preserved::pddataframe_=py::str(Preserved::pandas_.attr("DataFrame").get_type()).cast<std::string>();
 const py::object Preserved::pddataframe_ = getType(pandas_.attr("DataFrame")());
-const py::object Preserved::pdseries_ = getType(pandas_.attr("Series")());
+const py::object Preserved::pdNaT = getType(pandas_.attr("NaT"));
+const py::object Preserved::pdseries_ = getType(pandas_.attr("Series")(py::dtype("float64")));
 const py::object Preserved::nparray_ = getType(py::array());
 const py::object Preserved::npbool_ = getDType("bool");
 const py::object Preserved::npint8_ = getDType("int8");
@@ -54,30 +56,487 @@ const static long long npLongNan_ = 0x8000000000000000;
 static inline void SET_NPNAN(long long *p, size_t len = 1) { std::fill((long long *)p, ((long long *)p) + len, npLongNan_); }
 
 
-#define DLOG //printf
+#define DLOG //DLogger::Info
+#define RECORDTIME //RecordTime _recordTime
 
-py::object getPythonType(py::object &obj){
+py::object getPythonType(const py::object &obj){
     if(py::hasattr(obj, "dtype")){
         py::object dtypeOfObj=py::getattr(obj, "dtype");
         //py::object dtname=py::getattr(dtypeOfObj, "name");
         //std::string name=py::str(dtname);
         //DLOG("getPythonType: %s.",name.data());
         return dtypeOfObj;
-    }else{
-        //DLOG("getPythonType failed.");
     }
     return Preserved::pynone_;
 }
 
-py::object DdbPythonUtil::toPython(ConstantSP obj, bool tableFlag) {
-    if(obj.isNull()){
-        DLOG("toPython NULL to None.");
+void DdbPythonUtil::createPyVector(const ConstantSP &obj,py::object &pyObject,bool tableFlag,const ToPythonOption *poption){
+    //RECORDTIME("createPyVector");
+    VectorSP ddbVec = obj;
+    size_t size = ddbVec->size();
+    DATA_TYPE type = obj->getType();
+    //DLOG("toPython vector",Util::getDataTypeString(type).data(),size,tableFlag);
+    switch (type) {
+        case DT_VOID: {
+            py::array pyVec(py::dtype("object"));
+            pyVec.resize({size});
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_BOOL: {
+            py::array pyVec(py::dtype("bool"), {size}, {});
+            ddbVec->getBool(0, size, (char *)pyVec.mutable_data());
+            if (UNLIKELY(ddbVec->hasNull())) {
+                // Play with the raw api of Python, be careful about the ref count
+                DLOG("has null.");
+                pyVec = pyVec.attr("astype")("object");
+                PyObject **p = (PyObject **)pyVec.mutable_data();
+                char buf[1024];
+                int start = 0;
+                int N = size;
+                while (start < N) {
+                    int len = std::min(N - start, 1024);
+                    ddbVec->getBool(start, len, buf);
+                    for (int i = 0; i < len; ++i) {
+                        if(UNLIKELY(buf[i] == INT8_MIN)) {
+                            Py_DECREF(p[start + i]);
+                            p[start + i] = Preserved::numpy_.attr("nan").ptr();
+                        }
+                    }
+                    start += len;
+                }
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_CHAR: {
+            py::array pyVec(py::dtype("int8"), {size}, {});
+            ddbVec->getChar(0, size, (char *)pyVec.mutable_data());
+            if (UNLIKELY(ddbVec->hasNull())) {
+                DLOG("has null.");
+                pyVec = pyVec.attr("astype")("float64");
+                double *p = (double *)pyVec.mutable_data();
+                char buf[1024];
+                int start = 0;
+                int N = size;
+                while (start < N) {
+                    int len = std::min(N - start, 1024);
+                    ddbVec->getChar(start, len, buf);
+                    for (int i = 0; i < len; ++i) {
+                        if(UNLIKELY(buf[i] == INT8_MIN)) {
+                            SET_NPNAN(p + start + i, 1);
+                        }
+                    }
+                    start += len;
+                }
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_SHORT: {
+            py::array pyVec(py::dtype("int16"), {size}, {});
+            ddbVec->getShort(0, size, (short *)pyVec.mutable_data());
+            if (UNLIKELY(ddbVec->hasNull())) {
+                DLOG("has null.");
+                pyVec = pyVec.attr("astype")("float64");
+                double *p = (double *)pyVec.mutable_data();
+                short buf[1024];
+                int start = 0;
+                int N = size;
+                while (start < N) {
+                    int len = std::min(N - start, 1024);
+                    ddbVec->getShort(start, len, buf);
+                    for (int i = 0; i < len; ++i) {
+                        if(UNLIKELY(buf[i] == INT16_MIN)) {
+                            SET_NPNAN(p + start + i, 1);
+                        }
+                    }
+                    start += len;
+                }
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_INT: {
+            py::array pyVec(py::dtype("int32"), {size}, {});
+            ddbVec->getInt(0, size, (int *)pyVec.mutable_data());
+            if (UNLIKELY(ddbVec->hasNull())) {
+                DLOG("has null.");
+                pyVec = pyVec.attr("astype")("float64");
+                double *p = (double *)pyVec.mutable_data();
+                int buf[1024];
+                int start = 0;
+                int N = size;
+                while (start < N) {
+                    int len = std::min(N - start, 1024);
+                    ddbVec->getInt(start, len, buf);
+                    for (int i = 0; i < len; ++i) {
+                        if(UNLIKELY(buf[i] == INT32_MIN)) {
+                            DLOG("set %d null.", i);
+                            SET_NPNAN(p + start + i, 1);
+                        }
+                    }
+                    start += len;
+                }
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_LONG: {
+            py::array pyVec(py::dtype("int64"), {size}, {});
+            ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+            if (UNLIKELY(ddbVec->hasNull())) {
+                DLOG("has null.");
+                pyVec = pyVec.attr("astype")("float64");
+                double *p = (double *)pyVec.mutable_data();
+                long long buf[1024];
+                int start = 0;
+                int N = size;
+                while (start < N) {
+                    int len = std::min(N - start, 1024);
+                    ddbVec->getLong(start, len, buf);
+                    for (int i = 0; i < len; ++i) {
+                        if(UNLIKELY(buf[i] == INT64_MIN)) {
+                            SET_NPNAN(p + start + i, 1);
+                        }
+                    }
+                    start += len;
+                }
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_DATE: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                if (UNLIKELY(ddbVec->hasNull())) {
+                    DLOG("has null.");
+                    for (size_t i = 0; i < size; ++i) {
+                        if (UNLIKELY(p[i] == INT64_MIN)){
+                            SET_NPNAN(p + i,1);
+                        }else{
+                            p[i] *= 86400000000000;
+                        }
+                    }
+                }
+                else {
+                    for (size_t i = 0; i < size; ++i) {
+                        p[i] *= 86400000000000;
+                    }
+                }
+                pyObject=std::move(pyVec);
+            }else{
+                py::array pyVec(py::dtype("datetime64[D]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_MONTH: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[M]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                for (size_t i = 0; i < size; ++i) {
+                    if (UNLIKELY(p[i] == INT64_MIN)) {
+                        SET_NPNAN(p + i,1);
+                        continue;
+                    }
+                    if(p[i] < 1970 * 12 || p[i] > 2262 * 12 + 3) {
+                        throw RuntimeException("In dateFrame Month must between 1970.01M and 2262.04M");
+                    }
+                    p[i] -= 1970 * 12;
+                }
+                pyObject=std::move(pyVec);
+            }else{
+                py::array pyVec(py::dtype("datetime64[M]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                for (size_t i = 0; i < size; ++i) {
+                    if (UNLIKELY(p[i] == INT64_MIN)) {
+                        SET_NPNAN(p + i,1);
+                        continue;
+                    }
+                    p[i] -= 1970 * 12;
+                }
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_TIME: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                if (UNLIKELY(ddbVec->hasNull())) {
+                    DLOG("has null.");
+                    for (size_t i = 0; i < size; ++i) {
+                        if (UNLIKELY(p[i] == INT64_MIN)) {
+                            SET_NPNAN(p + i,1);
+                            continue;
+                        }
+                        p[i] *= 1000000;
+                    }
+                }
+                else {
+                    for (size_t i = 0; i < size; ++i) {
+                        p[i] *= 1000000;
+                    }
+                }
+                pyObject=std::move(pyVec);
+            }
+            else{
+                py::array pyVec(py::dtype("datetime64[ms]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_MINUTE: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                if (UNLIKELY(ddbVec->hasNull())) {
+                    DLOG("has null.");
+                    for (size_t i = 0; i < size; ++i) {
+                        if (UNLIKELY(p[i] == INT64_MIN)) {
+                            SET_NPNAN(p + i,1);
+                            continue;
+                        }
+                        p[i] *= 60000000000;
+                    }
+                }
+                else {
+                    for (size_t i = 0; i < size; ++i) {
+                        p[i] *= 60000000000;
+                    }
+                }
+                pyObject=std::move(pyVec);
+            }else{
+                py::array pyVec(py::dtype("datetime64[m]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                //DLOG(".datetime64[m] array.");
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_SECOND: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                if (UNLIKELY(ddbVec->hasNull())) {
+                    DLOG("has null.");
+                    for (size_t i = 0; i < size; ++i) {
+                        if (UNLIKELY(p[i] == INT64_MIN)) {
+                            SET_NPNAN(p + i,1);
+                            continue;
+                        }
+                        p[i] *= 1000000000;
+                    }
+                }
+                else {
+                    for (size_t i = 0; i < size; ++i) {
+                        p[i] *= 1000000000;
+                    }
+                }
+                pyObject=std::move(pyVec);
+            }
+            else{
+                py::array pyVec(py::dtype("datetime64[s]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_DATETIME: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                if (UNLIKELY(ddbVec->hasNull())) {
+                    DLOG("has null.");
+                    for (size_t i = 0; i < size; ++i) {
+                        if (UNLIKELY(p[i] == INT64_MIN)) {
+                            SET_NPNAN(p + i,1);
+                            continue;
+                        }
+                        p[i] *= 1000000000;
+                    }
+                }
+                else {
+                    for (size_t i = 0; i < size; ++i) {
+                        p[i] *= 1000000000;
+                    }
+                }
+                pyObject=std::move(pyVec);
+            }else{
+                py::array pyVec(py::dtype("datetime64[s]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_TIMESTAMP: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                if (UNLIKELY(ddbVec->hasNull())) {
+                    DLOG("has null.");
+                    for (size_t i = 0; i < size; ++i) {
+                        if (UNLIKELY(p[i] == INT64_MIN)) {
+                            SET_NPNAN(p + i,1);
+                            continue;
+                        }
+                        p[i] *= 1000000;
+                    }
+                }
+                else {
+                    for (size_t i = 0; i < size; ++i) {
+                        p[i] *= 1000000;
+                    }
+                }
+                pyObject=std::move(pyVec);
+            }else{
+                py::array pyVec(py::dtype("datetime64[ms]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_NANOTIME: {
+            py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+            ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_NANOTIMESTAMP: {
+            py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+            ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_DATEHOUR: {
+            if(tableFlag) {
+                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                long long *p = (long long *)pyVec.mutable_data();
+                if (UNLIKELY(ddbVec->hasNull())) {
+                    DLOG("has null.");
+                    for (size_t i = 0; i < size; ++i) {
+                        if (UNLIKELY(p[i] == INT64_MIN)) {
+                            SET_NPNAN(p + i,1);
+                            continue;
+                        }
+                        p[i] *= 3600000000000ll;
+                    }
+                }
+                else {
+                    for (size_t i = 0; i < size; ++i) {
+                        p[i] *= 3600000000000ll;
+                    }
+                }
+                pyObject=std::move(pyVec);
+            }
+            else {
+                py::array pyVec(py::dtype("datetime64[h]"), {size}, {});
+                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
+                pyObject=std::move(pyVec);
+            }
+            break;
+        }
+        case DT_FLOAT: {
+            py::array pyVec(py::dtype("float32"), {size}, {});
+            ddbVec->getFloat(0, size, (float *)pyVec.mutable_data());
+            if (UNLIKELY(ddbVec->hasNull())) {
+                DLOG("has null.");
+                auto p = (float *)pyVec.mutable_data();
+                float buf[1024];
+                int start = 0;
+                int N = size;
+                while (start < N) {
+                    int len = std::min(N - start, 1024);
+                    ddbVec->getFloat(start, len, buf);
+                    for (int i = 0; i < len; ++i) {
+                        if(UNLIKELY(buf[i] == FLT_NMIN)) {
+                            p[i] = NAN;
+                        }
+                    }
+                    start += len;
+                }
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_DOUBLE: {
+            py::array pyVec(py::dtype("float64"), {size}, {});
+            ddbVec->getDouble(0, size, (double *)pyVec.mutable_data());
+            if (UNLIKELY(ddbVec->hasNull())) {
+                DLOG("has null.");
+                double *p = (double *)pyVec.mutable_data();
+                double buf[1024];
+                int start = 0;
+                int N = size;
+                while (start < N) {
+                    int len = std::min(N - start, 1024);
+                    ddbVec->getDouble(start, len, buf);
+                    for (int i = 0; i < len; ++i) {
+                        if(UNLIKELY(buf[i] == DBL_NMIN)) {
+                            SET_NPNAN(p + start + i, 1);
+                        }
+                    }
+                    start += len;
+                }
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_IP:
+        case DT_UUID:
+        case DT_INT128:
+        case DT_SYMBOL:
+        case DT_STRING: {
+            py::array pyVec(py::dtype("object"), {size}, {});
+            for (size_t i = 0; i < size; ++i) {
+                py::str temp(ddbVec->getString(i));
+                Py_IncRef(temp.ptr());
+                memcpy(pyVec.mutable_data(i), &temp, sizeof(py::object));
+            }
+            pyObject=std::move(pyVec);
+            break;
+        }
+        case DT_ANY: {
+            // handle numpy.array of objects
+            py::list list(size);
+            for (size_t i = 0; i < size; ++i) {
+                list[i]=toPython(ddbVec->get(i),false,poption);
+            }
+            pyObject = std::move(list);
+            break;
+        }
+        default: {
+            throw RuntimeException("type error in Vector convertion! ");
+        };
+    }
+}
+
+py::object DdbPythonUtil::toPython(ConstantSP obj,bool tableFlag,const ToPythonOption *poption) {
+    //RECORDTIME("toPython");
+    if (obj.isNull() || obj->isNothing() || obj->isNull()){
+        DLOG("{ toPython NULL to None. }");
         return py::none();
     }
-    DLOG("{ toPython %s,%s %d flag %d.", Util::getDataTypeString(obj->getType()).data(),Util::getDataFormString(obj->getForm()).data(),obj->size(), tableFlag);
-    if (obj.isNull() || obj->isNothing() || obj->isNull()) { return py::none(); }
+    DLOG("{ toPython", Util::getDataTypeString(obj->getType()).data(),Util::getDataFormString(obj->getForm()).data(),obj->size(),"table",tableFlag);
+    static const ToPythonOption defaultOption;
+    if(poption==NULL)
+        poption=&defaultOption;
     DATA_TYPE type = obj->getType();
     DATA_FORM form = obj->getForm();
+    py::object pyObject;
     if (form == DF_VECTOR) {
         if(type == 128 + DT_SYMBOL){
             //SymbolVector
@@ -89,451 +548,116 @@ py::object DdbPythonUtil::toPython(ConstantSP obj, bool tableFlag) {
                 Py_IncRef(temp.ptr());
                 memcpy(pyVec.mutable_data(i), &temp, sizeof(py::object));
             }
-            return std::move(pyVec);
+            pyObject = std::move(pyVec);
         }else if(type >= ARRAY_TYPE_BASE){
             //ArrayVector
             FastArrayVector *arrayVector=(FastArrayVector*)obj.get();
-            size_t size = arrayVector->size();
-            py::array pyVec(py::dtype("object"), {size}, {});
-            for (size_t i = 0; i < size; ++i) {
-                VectorSP subArray = arrayVector->get(i);
-                py::object pySubVec = toPython(subArray, false);
-                Py_IncRef(pySubVec.ptr());
-                memcpy(pyVec.mutable_data(i), &pySubVec, sizeof(py::object));
-            }
-            return std::move(pyVec);
-        }
-        VectorSP ddbVec = obj;
-        size_t size = ddbVec->size();
-        DLOG("toPython vector %s size %d istable %d,",Util::getDataTypeString(type).data(),size,tableFlag);
-        switch (type) {
-            case DT_VOID: {
-                py::array pyVec;
-                pyVec.resize({size});
-                return std::move(pyVec);
-            }
-            case DT_BOOL: {
-                py::array pyVec(py::dtype("bool"), {size}, {});
-                ddbVec->getBool(0, size, (char *)pyVec.mutable_data());
-                if (UNLIKELY(ddbVec->hasNull())) {
-                    // Play with the raw api of Python, be careful about the ref count
-                    DLOG("has null.");
-                    pyVec = pyVec.attr("astype")("object");
-                    PyObject **p = (PyObject **)pyVec.mutable_data();
-                    char buf[1024];
-                    int start = 0;
-                    int N = size;
-                    while (start < N) {
-                        int len = std::min(N - start, 1024);
-                        ddbVec->getBool(start, len, buf);
-                        for (int i = 0; i < len; ++i) {
-                            if(UNLIKELY(buf[i] == INT8_MIN)) {
-                                Py_DECREF(p[start + i]);
-                                p[start + i] = Preserved::numpy_.attr("nan").ptr();
-                            }
-                        }
-                        start += len;
-                    }
-                }
-                return std::move(pyVec);
-            }
-            case DT_CHAR: {
-                py::array pyVec(py::dtype("int8"), {size}, {});
-                ddbVec->getChar(0, size, (char *)pyVec.mutable_data());
-                if (UNLIKELY(ddbVec->hasNull())) {
-                    DLOG("has null.");
-                    pyVec = pyVec.attr("astype")("float64");
-                    double *p = (double *)pyVec.mutable_data();
-                    char buf[1024];
-                    int start = 0;
-                    int N = size;
-                    while (start < N) {
-                        int len = std::min(N - start, 1024);
-                        ddbVec->getChar(start, len, buf);
-                        for (int i = 0; i < len; ++i) {
-                            if(UNLIKELY(buf[i] == INT8_MIN)) {
-                                SET_NPNAN(p + start + i, 1);
-                            }
-                        }
-                        start += len;
-                    }
-                }
-                return std::move(pyVec);
-            }
-            case DT_SHORT: {
-                py::array pyVec(py::dtype("int16"), {size}, {});
-                ddbVec->getShort(0, size, (short *)pyVec.mutable_data());
-                if (UNLIKELY(ddbVec->hasNull())) {
-                    DLOG("has null.");
-                    pyVec = pyVec.attr("astype")("float64");
-                    double *p = (double *)pyVec.mutable_data();
-                    short buf[1024];
-                    int start = 0;
-                    int N = size;
-                    while (start < N) {
-                        int len = std::min(N - start, 1024);
-                        ddbVec->getShort(start, len, buf);
-                        for (int i = 0; i < len; ++i) {
-                            if(UNLIKELY(buf[i] == INT16_MIN)) {
-                                SET_NPNAN(p + start + i, 1);
-                            }
-                        }
-                        start += len;
-                    }
-                }
-                return std::move(pyVec);
-            }
-            case DT_INT: {
-                py::array pyVec(py::dtype("int32"), {size}, {});
-                ddbVec->getInt(0, size, (int *)pyVec.mutable_data());
-                if (UNLIKELY(ddbVec->hasNull())) {
-                    DLOG("has null.");
-                    pyVec = pyVec.attr("astype")("float64");
-                    double *p = (double *)pyVec.mutable_data();
-                    int buf[1024];
-                    int start = 0;
-                    int N = size;
-                    while (start < N) {
-                        int len = std::min(N - start, 1024);
-                        ddbVec->getInt(start, len, buf);
-                        for (int i = 0; i < len; ++i) {
-                            if(UNLIKELY(buf[i] == INT32_MIN)) {
-                                DLOG("set %d null.", i);
-                                SET_NPNAN(p + start + i, 1);
-                            }
-                        }
-                        start += len;
-                    }
-                }
-                return std::move(pyVec);
-            }
-            case DT_LONG: {
-                py::array pyVec(py::dtype("int64"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                if (UNLIKELY(ddbVec->hasNull())) {
-                    DLOG("has null.");
-                    pyVec = pyVec.attr("astype")("float64");
-                    double *p = (double *)pyVec.mutable_data();
-                    long long buf[1024];
-                    int start = 0;
-                    int N = size;
-                    while (start < N) {
-                        int len = std::min(N - start, 1024);
-                        ddbVec->getLong(start, len, buf);
-                        for (int i = 0; i < len; ++i) {
-                            if(UNLIKELY(buf[i] == INT64_MIN)) {
-                                SET_NPNAN(p + start + i, 1);
-                            }
-                        }
-                        start += len;
-                    }
-                }
-                return std::move(pyVec);
-            }
-            case DT_DATE: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    if (UNLIKELY(ddbVec->hasNull())) {
-                        DLOG("has null.");
-                        for (size_t i = 0; i < size; ++i) {
-                            if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                            p[i] *= 86400000000000;
-                        }
-                    }
-                    else {
-                        for (size_t i = 0; i < size; ++i) {
-                            p[i] *= 86400000000000;
-                        }
-                    }
-                    return std::move(pyVec);
-                }
-                py::array pyVec(py::dtype("datetime64[D]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                return std::move(pyVec);
-            }
-            case DT_MONTH: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[M]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    for (size_t i = 0; i < size; ++i) {
-                        if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                        if(p[i] < 1970 * 12 || p[i] > 2262 * 12 + 3) {
-                            throw RuntimeException("In dateFrame Month must between 1970.01M and 2262.04M");
-                        }
-                        p[i] -= 1970 * 12;
-                    }
-                    return std::move(pyVec);
-                }
-                py::array pyVec(py::dtype("datetime64[M]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                long long *p = (long long *)pyVec.mutable_data();
-                for (size_t i = 0; i < size; ++i) {
-                    if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                    p[i] -= 1970 * 12;
-                }
-                return std::move(pyVec);
-            }
-            case DT_TIME: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    if (UNLIKELY(ddbVec->hasNull())) {
-                        DLOG("has null.");
-                        for (size_t i = 0; i < size; ++i) {
-                            if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                            p[i] *= 1000000;
-                        }
-                    }
-                    else {
-                        for (size_t i = 0; i < size; ++i) {
-                            p[i] *= 1000000;
-                        }
-                    }
-                    return std::move(pyVec);
-                }
-                py::array pyVec(py::dtype("datetime64[ms]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                return std::move(pyVec);
-            }
-            case DT_MINUTE: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    if (UNLIKELY(ddbVec->hasNull())) {
-                        DLOG("has null.");
-                        for (size_t i = 0; i < size; ++i) {
-                            if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                            p[i] *= 60000000000;
-                        }
-                    }
-                    else {
-                        for (size_t i = 0; i < size; ++i) {
-                            p[i] *= 60000000000;
-                        }
-                    }
-                    return std::move(pyVec);
-                }
-                py::array pyVec(py::dtype("datetime64[m]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                //DLOG(".datetime64[m] array.");
-                return std::move(pyVec);
-            }
-            case DT_SECOND: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    if (UNLIKELY(ddbVec->hasNull())) {
-                        DLOG("has null.");
-                        for (size_t i = 0; i < size; ++i) {
-                            if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                            p[i] *= 1000000000;
-                        }
-                    }
-                    else {
-                        for (size_t i = 0; i < size; ++i) {
-                            p[i] *= 1000000000;
-                        }
-                    }
-                    return std::move(pyVec);
-                }
-                py::array pyVec(py::dtype("datetime64[s]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                return std::move(pyVec);
-            }
-            case DT_DATETIME: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    if (UNLIKELY(ddbVec->hasNull())) {
-                        DLOG("has null.");
-                        for (size_t i = 0; i < size; ++i) {
-                            if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                            p[i] *= 1000000000;
-                        }
-                    }
-                    else {
-                        for (size_t i = 0; i < size; ++i) {
-                            p[i] *= 1000000000;
-                        }
-                    }
-                    return std::move(pyVec);
-                }
-                py::array pyVec(py::dtype("datetime64[s]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                return std::move(pyVec);
-            }
-            case DT_TIMESTAMP: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    if (UNLIKELY(ddbVec->hasNull())) {
-                        DLOG("has null.");
-                        for (size_t i = 0; i < size; ++i) {
-                            if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                            p[i] *= 1000000;
-                        }
-                    }
-                    else {
-                        for (size_t i = 0; i < size; ++i) {
-                            p[i] *= 1000000;
-                        }
-                    }
-                    return std::move(pyVec);
-                }
-                py::array pyVec(py::dtype("datetime64[ms]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                return std::move(pyVec);
-            }
-            case DT_NANOTIME: {
-                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                return std::move(pyVec);
-            }
-            case DT_NANOTIMESTAMP: {
-                py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                return std::move(pyVec);
-            }
-            case DT_DATEHOUR: {
-                if(tableFlag) {
-                    py::array pyVec(py::dtype("datetime64[ns]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    long long *p = (long long *)pyVec.mutable_data();
-                    if (UNLIKELY(ddbVec->hasNull())) {
-                        DLOG("has null.");
-                        for (size_t i = 0; i < size; ++i) {
-                            if (UNLIKELY(p[i] == INT64_MIN)) { continue; }
-                            p[i] *= 3600000000000ll;
-                        }
-                    }
-                    else {
-                        for (size_t i = 0; i < size; ++i) {
-                            p[i] *= 3600000000000ll;
-                        }
-                    }
-                    return std::move(pyVec);
-                }
-                else {
-                    py::array pyVec(py::dtype("datetime64[h]"), {size}, {});
-                    ddbVec->getLong(0, size, (long long *)pyVec.mutable_data());
-                    return std::move(pyVec);
-                }
-            }
-            case DT_FLOAT: {
-                py::array pyVec(py::dtype("float32"), {size}, {});
-                ddbVec->getFloat(0, size, (float *)pyVec.mutable_data());
-                if (UNLIKELY(ddbVec->hasNull())) {
-                    DLOG("has null.");
-                    auto p = (float *)pyVec.mutable_data();
-                    float buf[1024];
-                    int start = 0;
-                    int N = size;
-                    while (start < N) {
-                        int len = std::min(N - start, 1024);
-                        ddbVec->getFloat(start, len, buf);
-                        for (int i = 0; i < len; ++i) {
-                            if(UNLIKELY(buf[i] == FLT_NMIN)) {
-                                p[i]=NAN;
-                            }
-                        }
-                        start += len;
-                    }
-                }
-                return std::move(pyVec);
-            }
-            case DT_DOUBLE: {
-                py::array pyVec(py::dtype("float64"), {size}, {});
-                ddbVec->getDouble(0, size, (double *)pyVec.mutable_data());
-                if (UNLIKELY(ddbVec->hasNull())) {
-                    DLOG("has null.");
-                    double *p = (double *)pyVec.mutable_data();
-                    double buf[1024];
-                    int start = 0;
-                    int N = size;
-                    while (start < N) {
-                        int len = std::min(N - start, 1024);
-                        ddbVec->getDouble(start, len, buf);
-                        for (int i = 0; i < len; ++i) {
-                            if(UNLIKELY(buf[i] == DBL_NMIN)) {
-                                SET_NPNAN(p + start + i, 1);
-                            }
-                        }
-                        start += len;
-                    }
-                }
-                return std::move(pyVec);
-            }
-            case DT_IP:
-            case DT_UUID:
-            case DT_INT128:
-            case DT_SYMBOL:
-            case DT_STRING: {
+            if(poption->table2List==false){
+                DLOG("arrayvector to df",type);
+                size_t size = arrayVector->size();
                 py::array pyVec(py::dtype("object"), {size}, {});
                 for (size_t i = 0; i < size; ++i) {
-                    py::str temp(ddbVec->getString(i));
-                    Py_IncRef(temp.ptr());
-                    memcpy(pyVec.mutable_data(i), &temp, sizeof(py::object));
+                    VectorSP subArray = arrayVector->get(i);
+                    py::object pySubVec = toPython(subArray, tableFlag, poption);
+                    Py_IncRef(pySubVec.ptr());
+                    memcpy(pyVec.mutable_data(i), &pySubVec, sizeof(py::object));
                 }
-                return std::move(pyVec);
+                pyObject = std::move(pyVec);
+            }else{
+                DLOG("arrayvector to list",type);
+                size_t cols = arrayVector->checkVectorSize();
+                if(cols < 0){
+                    throw RuntimeException("array vector can't convert to a 2D array!");
+                }
+                VectorSP valueSP = arrayVector->getFlatValueArray();
+                py::object py1darray;
+                createPyVector(valueSP, py1darray, tableFlag, poption);
+                py::array py2DVec(py1darray);
+                size_t rows = arrayVector->rows();
+                py2DVec.resize( {rows, cols} );
+                pyObject = std::move(py2DVec);;
             }
-            case DT_ANY: {
-                // handle numpy.array of objects
-                auto l = py::list();
-                    for (size_t i = 0; i < size; ++i) { l.append(toPython(ddbVec->get(i))); }
-                    return py::array(l);
-            }
-            default: {
-                throw RuntimeException("type error in Vector convertion! ");
-            };
+        }else{
+            createPyVector(obj,pyObject,tableFlag,poption);
         }
     } else if (form == DF_TABLE) {
         TableSP ddbTbl = obj;
-        size_t columnSize = ddbTbl->columns();
-        using namespace py::literals;
-        py::array first = toPython(obj->getColumn(0), true);
-        auto colName = py::list();
-        colName.append(py::str(ddbTbl->getColumnName(0)));
-        py::object dataframe = Preserved::pandas_.attr("DataFrame")(first, "columns"_a = colName);
-        for (size_t i = 1; i < columnSize; ++i) {
-            ConstantSP col = obj->getColumn(i);
-            dataframe[ddbTbl->getColumnName(i).data()] = toPython(col, true);
+        if(poption->table2List==false){
+            size_t columnSize = ddbTbl->columns();
+            using namespace py::literals;
+            py::array first = toPython(ddbTbl->getColumn(0), true);
+            auto colName = py::list();
+            colName.append(py::str(ddbTbl->getColumnName(0)));
+            py::object dataframe = Preserved::pandas_.attr("DataFrame")(first, "columns"_a = colName);
+            for (size_t i = 1; i < columnSize; ++i) {
+                dataframe[ddbTbl->getColumnName(i).data()] = toPython(ddbTbl->getColumn(i), true, poption);
+            }
+            pyObject=std::move(dataframe);
+        }else{
+            size_t columnSize = ddbTbl->columns();
+            py::list pyList(columnSize);
+            for (size_t i = 0; i < columnSize; ++i) {
+                py::object temp = toPython(ddbTbl->getColumn(i),true,poption);
+                pyList[i] = temp;
+            }
+            pyObject=std::move(pyList);
         }
-        return dataframe;
     } else if (form == DF_SCALAR) {
         switch (type) {
-            case DT_VOID: return py::none();
-            case DT_BOOL: return py::bool_(obj->getBool());
+            case DT_VOID:
+                pyObject=std::move(py::none());
+                break;
+            case DT_BOOL:
+                pyObject=std::move(py::bool_(obj->getBool()));
+                break;
             case DT_CHAR:
             case DT_SHORT:
             case DT_INT:
-            case DT_LONG: return py::int_(obj->getLong());
-            case DT_DATE: return Preserved::datetime64_(obj->getLong(), "D");
-            case DT_MONTH: return Preserved::datetime64_(obj->getLong() - 23640, "M");    // ddb starts from 0000.0M
-            case DT_TIME: return Preserved::datetime64_(obj->getLong(), "ms");
-            case DT_MINUTE: return Preserved::datetime64_(obj->getLong(), "m");
-            case DT_SECOND: return Preserved::datetime64_(obj->getLong(), "s");
-            case DT_DATETIME: return Preserved::datetime64_(obj->getLong(), "s");
-            case DT_DATEHOUR: return Preserved::datetime64_(obj->getLong(), "h");
-            case DT_TIMESTAMP: return Preserved::datetime64_(obj->getLong(), "ms");
-            case DT_NANOTIME: return Preserved::datetime64_(obj->getLong(), "ns");
-            case DT_NANOTIMESTAMP: return Preserved::datetime64_(obj->getLong(), "ns");
+            case DT_LONG:
+                pyObject=std::move(py::int_(obj->getLong()));
+                break;
+            case DT_DATE:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "D"));
+                break;
+            case DT_MONTH:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong() - 23640, "M"));
+                break;    // ddb starts from 0000.0M
+            case DT_TIME:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "ms"));
+                break;
+            case DT_MINUTE:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "m"));
+                break;
+            case DT_SECOND:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "s"));
+                break;
+            case DT_DATETIME:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "s"));
+                break;
+            case DT_DATEHOUR:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "h"));
+                break;
+            case DT_TIMESTAMP:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "ms"));
+                break;
+            case DT_NANOTIME:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "ns"));
+                break;
+            case DT_NANOTIMESTAMP:
+                pyObject=std::move(Preserved::datetime64_(obj->getLong(), "ns"));
+                break;
             case DT_FLOAT:
-            case DT_DOUBLE: return py::float_(obj->getDouble());
+            case DT_DOUBLE:
+                pyObject=std::move(py::float_(obj->getDouble()));
+                break;
             case DT_IP:
             case DT_UUID:
             case DT_INT128:
-                //                    return py::bytes(reinterpret_cast<const char *>(obj->getBinary()));
             case DT_SYMBOL:
             case DT_BLOB:
-            case DT_STRING: return py::str(obj->getString());
+            case DT_STRING:
+                pyObject=std::move(py::str(obj->getString()));
+                break;
             default: throw RuntimeException("type error in Scalar convertion!");
         }
     } else if (form == DF_DICTIONARY) {
@@ -546,11 +670,11 @@ py::object DdbPythonUtil::toPython(ConstantSP obj, bool tableFlag) {
         VectorSP values = ddbDict->values();
         py::dict pyDict;
         if (keyType == DT_STRING) {
-            for (int i = 0; i < keys->size(); ++i) { pyDict[keys->getString(i).data()] = toPython(values->get(i)); }
+            for (int i = 0; i < keys->size(); ++i) { pyDict[keys->getString(i).data()] = toPython(values->get(i),false,poption); }
         } else {
-            for (int i = 0; i < keys->size(); ++i) { pyDict[py::int_(keys->getLong(i))] = toPython(values->get(i)); }
+            for (int i = 0; i < keys->size(); ++i) { pyDict[py::int_(keys->getLong(i))] = toPython(values->get(i),false,poption); }
         }
-        return pyDict;
+        pyObject=std::move(pyDict);
     } else if (form == DF_MATRIX) {
         ConstantSP ddbMat = obj;
         size_t rows = ddbMat->rows();
@@ -558,29 +682,31 @@ py::object DdbPythonUtil::toPython(ConstantSP obj, bool tableFlag) {
         // FIXME: currently only support numerical matrix
         if (ddbMat->getCategory() == MIXED) { throw RuntimeException("currently only support single typed matrix"); }
         ddbMat->setForm(DF_VECTOR);
-        py::array pyMat = toPython(ddbMat);
-        py::object pyMatRowLabel = toPython(ddbMat->getRowLabel());
-        py::object pyMatColLabel = toPython(ddbMat->getColumnLabel());
+        py::array pyMat = toPython(ddbMat,false,poption);
+        py::object pyMatRowLabel = toPython(ddbMat->getRowLabel(),false,poption);
+        py::object pyMatColLabel = toPython(ddbMat->getColumnLabel(),false,poption);
         pyMat.resize({cols, rows});
         pyMat = pyMat.attr("transpose")();
         py::list pyMatList;
         pyMatList.append(pyMat);
         pyMatList.append(pyMatRowLabel);
         pyMatList.append(pyMatColLabel);
-        return pyMatList;
+        pyObject=std::move(pyMatList);
     } else if (form == DF_PAIR) {
         VectorSP ddbPair = obj;
         py::list pyPair;
-        for (int i = 0; i < ddbPair->size(); ++i) { pyPair.append(toPython(ddbPair->get(i))); }
-        return pyPair;
+        for (int i = 0; i < ddbPair->size(); ++i) { pyPair.append(toPython(ddbPair->get(i),false,poption)); }
+        pyObject=std::move(pyPair);
     } else if (form == DF_SET) {
         VectorSP ddbSet = obj->keys();
         py::set pySet;
-        for (int i = 0; i < ddbSet->size(); ++i) { pySet.add(toPython(ddbSet->get(i))); }
-        return pySet;
+        for (int i = 0; i < ddbSet->size(); ++i) { pySet.add(toPython(ddbSet->get(i),false,poption)); }
+        pyObject=std::move(pySet);
     } else {
         throw RuntimeException("the form is not supported! ");
     }
+    DLOG("toPython", Util::getDataTypeString(obj->getType()).data(),Util::getDataFormString(obj->getForm()).data(),obj->size(), tableFlag,"}");
+    return pyObject;
 }
 
 DATA_TYPE numpyToDolphinDBType(py::array &array) {
@@ -607,7 +733,7 @@ DATA_TYPE numpyToDolphinDBType(py::array &array) {
     else if (type.equal(Preserved::npdatetime64M_()))
         return DT_MONTH;
     else if (type.equal(Preserved::npdatetime64m_()))
-        return DT_MINUTE;
+        return DT_DATETIME;
     else if (type.equal(Preserved::npdatetime64s_()))
         return DT_DATETIME;
     else if (type.equal(Preserved::npdatetime64h_()))
@@ -627,22 +753,159 @@ DATA_TYPE numpyToDolphinDBType(py::array &array) {
     }
 }
 
-static bool isValueNull(long long value){
+static inline bool isValueNull(long long value){
     return value == npLongNan_;
 }
 
-static bool isValueNull(double value){
+static inline bool isValueNull(double value){
     uint64_t r;
     memcpy(&r, &value, sizeof(r));
     return r == npDoubleNan_;
 }
 
-ConstantSP DdbPythonUtil::toDolphinDBScalar(py::object obj, DATA_TYPE typeIndicator) {
+template <typename T>
+void processData(T *psrcData, int size, std::function<void(T *, int)> f) {
+    int bufsize = std::min(1024, size);
+    T buf[bufsize];
+    int startIndex = 0, len;
+    while(startIndex < size){
+        len = std::min(size-startIndex, bufsize);
+        memcpy(buf, psrcData+startIndex, sizeof(T)*len);
+        f(buf,len);
+        startIndex += len;
+    }
+}
+
+void AddVectorData(VectorSP &ddbVec, py::array &pyVec, DATA_TYPE type,int size) {
+    //RECORDTIME(Util::getDataTypeString(type)+"AddVectorData");
+    DLOG("{ AddVectorData",Util::getDataTypeString(type),size,"start");
+    switch (type) {
+        case DT_BOOL: {
+            pyVec = pyVec.attr("astype")("int8");
+            ddbVec->appendBool((char*)pyVec.data(), size);
+            break;
+        }
+        case DT_CHAR: {
+            pyVec = pyVec.attr("astype")("int8");
+            ddbVec->appendChar((char*)pyVec.data(), size);
+            break;
+        }
+        case DT_SHORT: {
+            //append<short>(pyVec, size, [&](short *buf, int size) { ddbVec->appendShort(buf, size); });
+            pyVec = pyVec.attr("astype")("int16");
+            ddbVec->appendShort((short*)pyVec.data(),size);
+            break;
+        }
+        case DT_INT: {
+            //append<int>(pyVec, size, [&](int *buf, int size) { ddbVec->appendInt(buf, size); });
+            pyVec = pyVec.attr("astype")("int32");
+            ddbVec->appendInt((int*)pyVec.data(),size);
+            break;
+        }
+        case DT_MONTH: {
+            pyVec = pyVec.attr("astype")("int64");
+            processData<long long>((long long*)pyVec.data(), size, [&](long long *buf, int size) {
+                for(int i = 0; i < size; ++i)
+                    buf[i] += 23640;
+                ddbVec->appendLong(buf, size);
+            });
+            break;
+        }
+        case DT_DATE:
+        case DT_TIME:
+        case DT_MINUTE:
+        case DT_SECOND:
+        case DT_DATETIME:
+        case DT_DATEHOUR:
+        case DT_TIMESTAMP:
+        case DT_NANOTIME:
+        case DT_NANOTIMESTAMP:
+        case DT_LONG: {
+            //append<long long>(pyVec, size, [&](long long *buf, int size) { ddbVec->appendLong(buf, size); });
+            pyVec = pyVec.attr("astype")("int64");
+            ddbVec->appendLong((long long*)pyVec.data(),size);
+            break;
+        }
+        case DT_FLOAT: {
+            //append<float>(pyVec, size, [&](float *buf, int size) { ddbVec->appendFloat(buf, size); });
+            pyVec = pyVec.attr("astype")("float32");
+            bool hasnull=false;
+            processData<float>((float*)pyVec.data(), size, [&](float *buf, int size) {
+                for(int i=0; i < size;i++){
+                    if(buf[i]==NAN) {
+                        buf[i] = FLT_NMIN;
+                        hasnull=true;
+                    }
+                }
+                ddbVec->appendFloat(buf, size);
+            });
+            ddbVec->setNullFlag(hasnull);
+            break;
+        }
+        case DT_DOUBLE: {
+            pyVec = pyVec.attr("astype")("float64");
+            bool hasnull=false;
+            processData<double>((double*)pyVec.data(), size, [&](double *buf, int size) {
+                for(int i=0; i < size;i++){
+                    if(buf[i] == NAN) {
+                        buf[i] = DBL_NMIN;
+                        hasnull=true;
+                    }
+                }
+                ddbVec->appendDouble(buf, size);
+            });
+            ddbVec->setNullFlag(hasnull);
+            break;
+        }
+        case DT_IP:
+        case DT_UUID:
+        case DT_INT128:
+        case DT_SYMBOL:
+        case DT_BLOB:
+        case DT_STRING:
+        {
+            vector<std::string> strs;
+            strs.reserve(size);
+            for (auto it = pyVec.begin(); it != pyVec.end(); ++it) {
+                strs.emplace_back(py::reinterpret_borrow<py::str>(*it).cast<std::string>());
+            }
+            ddbVec->appendString(strs.data(), strs.size());
+            break;
+        }
+        case DT_ANY: {
+            // extra check (determine string vector or any vector)
+            for (auto it = pyVec.begin(); it != pyVec.end(); ++it) {
+                ConstantSP item = DdbPythonUtil::toDolphinDB(py::reinterpret_borrow<py::object>(*it));
+                ddbVec->append(item);
+            }
+            break;
+        }
+        default: {
+            throw RuntimeException("type error in numpy: " + Util::getDataTypeString(type));
+        }
+    }
+    DLOG("AddVectorData",Util::getDataTypeString(type),size,"end }");
+}
+
+void DdbPythonUtil::toDolphinDBScalar(const py::object *obj, const DATA_TYPE *type, int size, vector<ConstantSP> &result){
+    for(int i = 0; i < size; i++){
+        result.push_back(_toDolphinDBScalar(obj[i], type[i]));
+    }
+}
+
+void DdbPythonUtil::toDolphinDBScalar(const py::object *obj, int size, DATA_TYPE type, vector<ConstantSP> &result){
+    for(int i = 0; i < size; i++){
+        result.push_back(_toDolphinDBScalar(obj[i], type));
+    }
+}
+
+inline ConstantSP DdbPythonUtil::_toDolphinDBScalar(const py::object &obj, DATA_TYPE typeIndicator) {
+    //RECORDTIME("toDolphinDBScalar");
     //DLOG("toDolphinDBScalar.start.");
-    if(typeIndicator >= ARRAY_TYPE_BASE){//ArrayVector
+    if(typeIndicator >= ARRAY_TYPE_BASE){//Element in ArrayVector, it's a vector
         DATA_TYPE eleType = (DATA_TYPE)(typeIndicator - ARRAY_TYPE_BASE);
         ConstantSP dataVector;
-        if(createVectorMatrix(obj, eleType, dataVector) == false){
+        if(createVectorMatrix(obj, eleType, dataVector,ANY_ARRAY_VECTOR_OPTION::AAV_DISABLE) == false){
             throw RuntimeException("Python data [" + py::str(obj.get_type()).cast<std::string>()+"] mismatch array vector type "+Util::getDataTypeString(eleType).data());
         }
         VectorSP anyVector = Util::createVector(DT_ANY, 0, 1);
@@ -671,6 +934,8 @@ ConstantSP DdbPythonUtil::toDolphinDBScalar(py::object obj, DATA_TYPE typeIndica
     } else if (py::isinstance(obj, Preserved::pystr_)) {
         auto result = obj.cast<std::string>();
         return Util::createObject(typeIndicator, result);
+    } else if(py::isinstance(obj, Preserved::pdNaT)){
+        return Util::createNullConstant(typeIndicator);
     } else if (py::isinstance(obj, Preserved::pybytes_)) {
         auto result = obj.cast<std::string>();
         return Util::createObject(typeIndicator, result);
@@ -695,7 +960,7 @@ ConstantSP DdbPythonUtil::toDolphinDBScalar(py::object obj, DATA_TYPE typeIndica
             constobj=Util::createMonth(1970, 1 + value);
         } else if (type.equal(Preserved::npdatetime64m_())) {
             //DLOG("toDolphinDBScalar_Pythontype npdatetime64m_. ");
-            constobj=Util::createMinute(value);
+            constobj=Util::createDateTime(value*60);
         } else if (type.equal(Preserved::npdatetime64s_())) {
             //DLOG("toDolphinDBScalar_Pythontype npdatetime64s_. ");
             constobj=Util::createDateTime(value);
@@ -751,11 +1016,11 @@ ConstantSP DdbPythonUtil::toDolphinDBScalar(py::object obj, DATA_TYPE typeIndica
     }
 }
 
-DATA_TYPE toDolphinDBDataType(py::object obj, bool &isnull) {
+DATA_TYPE toDolphinDBDataType(const py::object &obj, bool &isnull) {
     isnull=false;
     if (py::isinstance(obj, Preserved::pynone_)) {
         isnull=true;
-        return DATA_TYPE::DT_DOUBLE;
+        return DATA_TYPE::DT_OBJECT;
     } else if (py::isinstance(obj, Preserved::pybool_)) {
         return DATA_TYPE::DT_BOOL;
     } else if (py::isinstance(obj, Preserved::pyint_)) {
@@ -770,6 +1035,9 @@ DATA_TYPE toDolphinDBDataType(py::object obj, bool &isnull) {
         return DATA_TYPE::DT_STRING;
     } else if (py::isinstance(obj, Preserved::pybytes_)) {
         return DATA_TYPE::DT_BLOB;
+    }else if(py::isinstance(obj, Preserved::pdNaT)){
+        isnull=true;
+        return DATA_TYPE::DT_NANOTIMESTAMP;
     } else if (py::isinstance(obj, Preserved::datetime64_)) {
         //DLOG("toDolphinDBDataType.datetime64.start.");
         py::object type = getPythonType(obj);
@@ -789,7 +1057,7 @@ DATA_TYPE toDolphinDBDataType(py::object obj, bool &isnull) {
             //DLOG("toDolphinDBDataType npdatetime64M_. ");
             return DATA_TYPE::DT_MONTH;
         } else if (type.equal(Preserved::npdatetime64m_())) {
-            return DATA_TYPE::DT_MINUTE;
+            return DATA_TYPE::DT_DATETIME;
         } else if (type.equal(Preserved::npdatetime64s_())) {
             return DATA_TYPE::DT_DATETIME;
         } else if (type.equal(Preserved::npdatetime64h_())) {
@@ -801,7 +1069,7 @@ DATA_TYPE toDolphinDBDataType(py::object obj, bool &isnull) {
         }else if (type.equal(Preserved::npdatetime64_())) {
             return DATA_TYPE::DT_DATETIME;
         } else {
-            //DLOG("unsupported python data type numpy.datetime64 [%s].",py::str(obj.get_type()).cast<std::string>().data());
+            DLOG("unsupported python data type numpy.datetime64 [%s].",py::str(obj.get_type()).cast<std::string>().data());
             return DATA_TYPE::DT_OBJECT;
         }
     }
@@ -825,24 +1093,22 @@ DATA_TYPE toDolphinDBDataType(py::object obj, bool &isnull) {
     } else if (type.equal(Preserved::npdatetime64_())) {
         return DATA_TYPE::DT_DATETIME;
     } else {
-        //DLOG("unsupported python data type [%s].",py::str(obj.get_type()).cast<std::string>().data());
+        DLOG("unsupported python data type ",py::str(obj.get_type()).cast<std::string>().data());
         return DATA_TYPE::DT_OBJECT;
     }
 }
 
-bool isObjArray(py::object &obj){
+inline bool isObjArray(py::object obj){
     return py::isinstance(obj, Preserved::pytuple_)||
             py::isinstance(obj, Preserved::pylist_)||
             py::isinstance(obj, Preserved::nparray_)||
             py::isinstance(obj, Preserved::pdseries_);
 }
 
-bool DdbPythonUtil::createVectorMatrix(py::object obj, DATA_TYPE typeIndicator, ConstantSP &ddbvector){
-    vector<py::object> children;
-    size_t rows, cols;
-    DATA_TYPE type = typeIndicator;
+//if pdataaddress is null, no children
+bool getVectorChildren(py::object &obj, DATA_TYPE &type, vector<py::object> &children, size_t &rows, size_t &cols){
     if(py::isinstance(obj, Preserved::pytuple_)){
-        DLOG("pytuple_ start.");
+        DLOG("pytuple_.");
         py::tuple pyVec = obj;
         rows = 1;
         cols = pyVec.size();
@@ -853,7 +1119,7 @@ bool DdbPythonUtil::createVectorMatrix(py::object obj, DATA_TYPE typeIndicator, 
         }
         //DLOG("pytuple_ end.");
     }else if(py::isinstance(obj, Preserved::pylist_)){
-        DLOG("pylist_ start.");
+        DLOG("pylist_.");
         py::list pyVec = obj;
         rows = 1;
         cols = pyVec.size();
@@ -869,7 +1135,7 @@ bool DdbPythonUtil::createVectorMatrix(py::object obj, DATA_TYPE typeIndicator, 
         //DLOG("nparrayseries_ %s start.", text.data());
         py::array pyVec = obj;
         int dim = pyVec.ndim();
-        DLOG("nparrayseries_dim %d.", dim);
+        DLOG("nparray_series_dim", dim);
         if(dim == 1){
             rows = 1;
             cols = pyVec.size();
@@ -881,64 +1147,221 @@ bool DdbPythonUtil::createVectorMatrix(py::object obj, DATA_TYPE typeIndicator, 
         }else{
             throw RuntimeException("numpy.ndarray with dimension > 2 is not supported");
         }
+        if(type == DT_OBJECT){
+            type = numpyToDolphinDBType(pyVec);
+            //DLOG("VectorNumpy_numpyToDolphinDBType: %s.",Util::getDataTypeString(type).data());
+        }
         children.resize(pyVec.size());
         int index=0;
         for (auto it = pyVec.begin(); it != pyVec.end(); ++it) {//check if child is array
             children[index++]=py::reinterpret_borrow<py::object>(*it);
         }
-        if(type == DT_OBJECT){
-            type = numpyToDolphinDBType(pyVec);
-            //DLOG("VectorNumpy_numpyToDolphinDBType: %s.",Util::getDataTypeString(type).data());
-        }
         //DLOG("nparrayseries_ end.");
     }else{
         return false;
     }
-    if(type == DT_OBJECT){//unknow type
-        bool isnull;
-        DATA_TYPE curType, nullType = DT_OBJECT;
-        for(auto &one : children){
-            if(isObjArray(one)){
-                type = DATA_TYPE::DT_ANY;
-                break;
+    return true;
+}
+
+bool checkType(const py::object &obj,DATA_TYPE &type,DATA_TYPE &nullType,DdbPythonUtil::ANY_ARRAY_VECTOR_OPTION option, bool &isArrayVector){
+    if(isObjArray(obj)){//has child vector
+        if(option == DdbPythonUtil::AAV_ANYVECTOR){//pref any vector
+            type = DATA_TYPE::DT_ANY;
+        }else if(option == DdbPythonUtil::AAV_ARRAYVECTOR){//pref array vector
+            isArrayVector =true;
+        }else if(option == DdbPythonUtil::AAV_DISABLE){//disable child vector
+            throw RuntimeException("unexpected vector form in object.");
+        }
+        return true;
+    }
+    if(py::isinstance(obj, Preserved::pynone_))//null can be any type, ignore it
+        return false;
+    bool isnull;
+    DATA_TYPE curType = toDolphinDBDataType(obj,isnull);
+    DLOG("getChildrenType",Util::getDataTypeString(curType).data(),"isnull",isnull);
+    if(isnull){
+        if(curType != DT_OBJECT)
+            nullType = curType;
+        //keep type last value.
+        return false;
+    }
+    if(curType == DT_OBJECT){
+        DLOG("toAny for Object type.");
+        type = DATA_TYPE::DT_ANY;
+        return true;
+    }
+    if(type == DT_OBJECT){//type is default value, set it
+        type = curType;
+        return false;
+    }
+    if(type != curType){//two types, set any
+        DLOG("toAny for",Util::getDataTypeString(type).data(),"!=",Util::getDataTypeString(curType).data());
+        type = DATA_TYPE::DT_ANY;
+        return true;
+    }
+    return false;
+}
+
+DATA_TYPE getChildrenType(const vector<py::object> &children, DdbPythonUtil::ANY_ARRAY_VECTOR_OPTION option, bool &isArrayVector){
+    DATA_TYPE type = DT_OBJECT;
+    DATA_TYPE nullType = DT_OBJECT;
+    for(auto &one : children){
+        if(checkType(one,type,nullType,option,isArrayVector))
+            break;
+    }
+    if(type == DT_OBJECT){//Is all none???
+        if(nullType != DT_OBJECT){//Set null object type
+            type = nullType;
+            DLOG("all null, set to last null type",Util::getDataTypeString(nullType).data());
+        }
+    }
+    return type;
+}
+
+bool DdbPythonUtil::createVectorMatrix(py::object obj, DATA_TYPE typeIndicator, ConstantSP &ddbResult, ANY_ARRAY_VECTOR_OPTION option){
+    //RECORDTIME("createVectorMatrix");
+    vector<py::object> children;
+    size_t rows, cols;
+    bool isArrayVector = (typeIndicator >= ARRAY_TYPE_BASE);
+    DATA_TYPE type = typeIndicator;
+    if(isArrayVector==false&&
+        (py::isinstance(obj, Preserved::nparray_)
+            ||py::isinstance(obj, Preserved::pdseries_))){
+        //numpy array
+        py::array pyVec = obj;
+        int dim = pyVec.ndim();
+        if(dim == 1){
+            DLOG("nparray_series_dim", dim);
+            if(type == DT_OBJECT){
+                type = numpyToDolphinDBType(pyVec);
+                if(type == DT_OBJECT){
+                    DATA_TYPE nullType = DT_OBJECT;
+                    py::object obj;
+                    for (auto it = pyVec.begin(); it != pyVec.end(); ++it) {
+                        obj=py::reinterpret_borrow<py::object>(*it);
+                        if(checkType(obj,type,nullType,option,isArrayVector))
+                            break;
+                        if(type != DT_OBJECT && option == ANY_ARRAY_VECTOR_OPTION::AAV_ARRAYVECTOR){
+                            break;
+                        }
+                    }
+                    if(isArrayVector==false){
+                        if(type == DT_OBJECT){//Is all none???
+                            if(nullType != DT_OBJECT){//Set null object type
+                                type = nullType;
+                                DLOG("all null, set to last null type",Util::getDataTypeString(nullType).data());
+                            }
+                        }
+                    }
+                }
             }
-            if(py::isinstance(one, Preserved::pynone_))//null can be any type, ignore it
-                continue;
-            curType = toDolphinDBDataType(one,isnull);
-            DLOG("Vector_toDolphinDBDataType: %s is null %d.",Util::getDataTypeString(curType).data(),isnull);
-            if(isnull){
-                nullType = curType;
-                //keep type last value.
-                continue;
-            }
-            if(curType == DT_OBJECT){
-                DLOG("toAny for Object type.");
-                type = DATA_TYPE::DT_ANY;
-                break;
-            }
-            if(type == DT_OBJECT){//type is default value, set it
-                type = curType;
-                continue;
-            }
-            if(type != curType){//two types, set any
-                DLOG("toAny for %s!=%s.",Util::getDataTypeString(type).data(),Util::getDataTypeString(curType).data());
-                type = DATA_TYPE::DT_ANY;
-                break;
+            if(isArrayVector==false && type != DT_OBJECT){
+                int size = pyVec.size();
+                VectorSP ddbVec;
+                ddbVec = Util::createVector(type, 0, size);
+                AddVectorData(ddbVec,pyVec,type,size);
+                ddbResult=ddbVec;
+                return true;
             }
         }
-        if(type == DT_OBJECT){//Is all none???
-            if(nullType != DT_OBJECT){
-                type = nullType;
-                DLOG("all null, set to last null type %s.",Util::getDataTypeString(nullType).data());
-            }else{
-                DLOG("toAny for All Object type.");
+    }
+    if(getVectorChildren(obj, type, children, rows, cols) == false){
+        if(isArrayVector){
+            throw RuntimeException("unexpected array vector object.");
+        }
+        return false;
+    }
+    if(isArrayVector == false && type == DT_OBJECT){//unknow type, or if it is arrayvector in dataframe/np.array
+        type = getChildrenType(children,option,isArrayVector);
+        if(isArrayVector == false){
+            if(type == DT_OBJECT){//Is all none???
                 type = DT_DOUBLE;
             }
         }
     }
-    DLOG("createVectorMatrix type %s shape %d*%d size %d start.",Util::getDataTypeString(type).data(),rows,cols,children.size());
-    if(rows <= 1){//vector
+    DLOG("{ createVectorMatrix type",Util::getDataTypeString(type).data(),rows,cols,children.size(),"isarrayvector",isArrayVector,option);
+    if(isArrayVector){
+        //RECORDTIME("createVectorMatrix_arrayvector");
+        if(rows > 1){
+            throw RuntimeException("unpexpected matrix for array vector object.");
+        }
+        DATA_TYPE eleType;
+        Vector *pArrayVector = NULL;
+        VectorSP pchildVector;
+        vector<py::object> grandsons;
+        size_t grandsonRows, grandsonCols;
+        size_t startChildIndex = 0;
+        size_t childSize = children.size();
+        if(type == DT_OBJECT){//unknow type
+            vector<int> noneRowCounts;
+            bool tmpIsArrayVector;
+            noneRowCounts.reserve(childSize);
+            for(; startChildIndex < childSize; startChildIndex++){
+                if(getVectorChildren(children[startChildIndex], type, grandsons, grandsonRows, grandsonCols) == false){
+                    throw RuntimeException("invalid array vector object.");
+                }
+                if(grandsonRows > 1){
+                    throw RuntimeException("unpexpected matrix for array vector object.");
+                }
+                if(type == DT_ANY){
+                    throw RuntimeException("unpexpected any type for array vector object.");
+                }
+                if(type == DT_OBJECT){// unknow type
+                    type = getChildrenType(grandsons,ANY_ARRAY_VECTOR_OPTION::AAV_DISABLE,tmpIsArrayVector);
+                    if(type == DT_OBJECT){//Is all none? save none object size
+                        noneRowCounts.push_back(grandsons.size());
+                        continue;
+                    }
+                }
+                DLOG("arrayvector type determined",Util::getDataTypeString(type).data());
+                eleType = type;
+                type = (DATA_TYPE)(eleType + ARRAY_TYPE_BASE);
+                pArrayVector = Util::createArrayVector(type, 0, children.size());
+                ddbResult = pArrayVector;
+
+                if(noneRowCounts.size() > 0){//has all none object
+                    DLOG("add void %d.",noneRowCounts.size());
+                    for(auto count : noneRowCounts){
+                        pchildVector = Util::createVector(eleType, 0, count);
+                        for( int i = 0; i < count; i ++){
+                            pchildVector->append(Constant::void_);
+                        }
+                        pArrayVector->append(pchildVector);
+                    }
+                }
+                break;
+            }
+            if(pArrayVector == NULL){
+                throw RuntimeException("unexpected all none object in array vector.");
+            }
+        }else{
+            eleType = (DATA_TYPE)(type - ARRAY_TYPE_BASE);
+            pArrayVector = Util::createArrayVector(type, 0, children.size());
+            ddbResult = pArrayVector;
+        }
+        DATA_TYPE tmpType = type;
+        VectorSP panyVector;
+        for(; startChildIndex < childSize; startChildIndex++){
+            if(getVectorChildren(children[startChildIndex], tmpType, grandsons, grandsonRows, grandsonCols) == false){
+                throw RuntimeException("invalid array vector object.");
+            }
+            if(grandsonRows > 1){
+                throw RuntimeException("unpexpected matrix for array vector object.");
+            }
+            pchildVector = Util::createVector(eleType, 0, grandsons.size());
+            vector<ConstantSP> list;
+            list.reserve(grandsons.size());
+            toDolphinDBScalar(grandsons.data(),grandsons.size(), eleType, list);
+            for(size_t i=0;i<list.size();i++){
+                pchildVector->append(list[i]);
+            }
+            panyVector=Util::createVector(DT_ANY,0,1);
+            panyVector->append(pchildVector);
+            pArrayVector->append(panyVector);
+        }
+    }else if(rows <= 1){//vector
         //DLOG("createVector_%s.",Util::getDataTypeString(type).data());
+        //RECORDTIME("createVectorMatrix_any");
         VectorSP ddbVec = Util::createVector(type, 0, children.size());
         DATA_TYPE objType = type;
         if(objType == DT_ANY)
@@ -950,8 +1373,9 @@ bool DdbPythonUtil::createVectorMatrix(py::object obj, DATA_TYPE typeIndicator, 
             ddbVec->append(item);
         }
         //DLOG("vector %s %d.",Util::getDataTypeString(type).data(),(int)children.size());
-        ddbvector=ddbVec;
+        ddbResult=ddbVec;
     }else{//matrix
+        //RECORDTIME("createVectorMatrix_matrix");
         //DLOG("createMatrix_%s.",Util::getDataTypeString(type).data());
         ConstantSP ddbMat = Util::createMatrix(type, cols, rows, cols);
         //DLOG("toDolphinDB.Matrix2.");
@@ -968,20 +1392,17 @@ bool DdbPythonUtil::createVectorMatrix(py::object obj, DATA_TYPE typeIndicator, 
         }
         //DLOG("matrix %s %d,%d.",Util::getDataTypeString(type).data(),(int)rows,(int)cols);
         //DLOG("toDolphinDB.Matrix9.");
-        ddbvector=ddbMat;
+        ddbResult=ddbMat;
     }
-    DLOG("createVectorMatrix type %s shape %d*%d size %d end.",Util::getDataTypeString(type).data(),rows,cols,children.size());
+    DLOG("createVectorMatrix type",Util::getDataTypeString(type).data(),rows,cols,children.size(),"}");
     return true;
 }
 
 ConstantSP DdbPythonUtil::toDolphinDB(py::object obj, DATA_FORM formIndicator, DATA_TYPE typeIndicator) {
-    DLOG("{ toDolphinDB:");
-     //if(formIndicator!=DF_CHUNK||typeIndicator!=DT_OBJECT){
-     //    DLOG("toDolphinDB start %s,%s: ",Util::getDataTypeString(typeIndicator).data(),
-     //                                Util::getDataFormString(formIndicator).data());
-     //}
+    //RECORDTIME("toDolphinDB");
+    DLOG("{ toDolphinDB start",Util::getDataTypeString(typeIndicator).data(),Util::getDataFormString(formIndicator).data());
     ConstantSP ddbConst;
-    if(createVectorMatrix(obj, typeIndicator, ddbConst) == false){//it's not vector
+    if(isObjArray(obj) == false || createVectorMatrix(obj, typeIndicator, ddbConst, AAV_ANYVECTOR) == false){//it's not vector
         if(formIndicator == DF_VECTOR){// Exception: vector is expected
             throw RuntimeException("Unexpected DF_VECTOR form type "+py::str(obj.get_type()).cast<std::string>());
         }
@@ -1015,14 +1436,20 @@ ConstantSP DdbPythonUtil::toDolphinDB(py::object obj, DATA_FORM formIndicator, D
 
             vector<ConstantSP> columns;
             columns.reserve(columnSize);
+            DATA_TYPE type;
             for (size_t i = 0; i < columnSize; ++i) {
-                DLOG("pddataframe column %d." , i);
+                DLOG("pddataframe column" , i);
+                py::object boject;
                 if (typeIndicators.contains(columnNames[i].data())) {
-                    DATA_TYPE type = static_cast<DATA_TYPE>(typeIndicators[columnNames[i].data()].cast<int>());
-                    columns.emplace_back(toDolphinDB(py::array(dataframe[columnNames[i].data()]), DF_VECTOR, type));
-                } else {
-                    columns.emplace_back(toDolphinDB(py::array(dataframe[columnNames[i].data()])));
+                    type = static_cast<DATA_TYPE>(typeIndicators[columnNames[i].data()].cast<int>());
+                }else{
+                    type = DT_OBJECT;
                 }
+                ConstantSP ddbColumn;
+                if(createVectorMatrix(py::array(dataframe[columnNames[i].data()]), type, ddbColumn, ANY_ARRAY_VECTOR_OPTION::AAV_ARRAYVECTOR) == false){
+                    throw RuntimeException("DolphinDB only support vector as column.");
+                }
+                columns.emplace_back(ddbColumn);
             }
             TableSP ddbTbl = Util::createTable(columnNames, columns);
             DLOG("toDolphinDB.pddataframe.end. }");
@@ -1114,17 +1541,228 @@ ConstantSP DdbPythonUtil::toDolphinDB(py::object obj, DATA_FORM formIndicator, D
                 typeIndicator = toDolphinDBDataType(obj,isnull);
                 //DLOG("toDolphindb_toDolphinDBDataType: %s.",Util::getDataTypeString(typeIndicator).data());
                 if(typeIndicator == DT_OBJECT){
-                    throw RuntimeException("DolphinDB doesn't support Python data " + py::str(obj.get_type()).cast<std::string>());
+                    if(isnull){//set null default type: double
+                        typeIndicator=DT_DOUBLE;
+                    }else{
+                        throw RuntimeException("DolphinDB doesn't support Python data " + py::str(obj.get_type()).cast<std::string>());
+                    }
                 }
             }
             //DLOG("toDolphinDB.toDolphinDBScalar.start.");
-            DLOG("toDolphindb_toDolphinDBScalar: %s.",Util::getDataTypeString(typeIndicator).data());
-            ddbConst=toDolphinDBScalar(obj, typeIndicator);
+            DLOG("toDolphindb_toDolphinDBScalar",Util::getDataTypeString(typeIndicator).data());
+            ddbConst=_toDolphinDBScalar(obj, typeIndicator);
         }
     }
     //DLOG("toDolphinDB.end.\n");
-    DLOG(" toDolphinDB %s,%s %d.}", Util::getDataTypeString(ddbConst->getType()).data(),Util::getDataFormString(ddbConst->getForm()).data(),ddbConst->size()); if(ddbConst->size()>1) DLOG("\n");
+    DLOG("toDolphinDB", Util::getDataTypeString(ddbConst->getType()).data(),Util::getDataFormString(ddbConst->getForm()).data(),ddbConst->size(),"}");
     return ddbConst;
+}
+
+py::object DdbPythonUtil::loadPickleFile(const std::string &filepath){
+    py::dict statusDict;
+    string shortFilePath=filepath+"_s";
+    FILE *pf;
+    pf=fopen(shortFilePath.data(),"rb");
+    if(pf==NULL){
+        pf=fopen(filepath.data(),"rb");
+        if(pf==NULL){
+            statusDict["errorCode"]=-1;
+            statusDict["errorInfo"]=filepath+" can't open.";
+            return statusDict;
+        }
+        FILE *pfwrite=fopen(shortFilePath.data(),"wb");
+        if(pfwrite==NULL){
+            statusDict["errorCode"]=-1;
+            statusDict["errorInfo"]=shortFilePath+" can't open.";
+            return statusDict;
+        }
+        char buf[4096];
+        int readlen;
+        {
+            char tmp;
+            char header=0x80;
+            int version;
+            while(fread(&tmp,1,1,pf)==1){
+                while(tmp==header){
+                    if(fread(&tmp,1,1,pf)!=1)
+                        break;
+                    version=(unsigned char)tmp;
+                    DLOG(version);
+                    if(version>=0&&version<=5){
+                        fwrite(&header,1,1,pfwrite);
+                        fwrite(&tmp,1,1,pfwrite);
+                        goto nextread;
+                    }
+                }
+            }
+        }
+    nextread:
+        while((readlen=fread(buf,1,4096,pf))>0){
+            fwrite(buf,1,readlen,pfwrite);
+        }
+        fclose(pf);
+        fclose(pfwrite);
+        pf=fopen(shortFilePath.data(),"rb");
+    }
+    if(pf==NULL){
+        statusDict["errorCode"]=-1;
+        statusDict["errorInfo"]=filepath+" can't open.";
+        return statusDict;
+    }
+    DataInputStreamSP dis=new DataInputStream(pf);
+    std::unique_ptr<PickleUnmarshall> unmarshall(new PickleUnmarshall(dis));
+    IO_ERR ret;
+    short flag=0;
+    if (!unmarshall->start(flag, true, ret)) {
+        unmarshall->reset();
+        statusDict["errorCode"]=(int)ret;
+        statusDict["errorInfo"]="unmarshall failed";
+        return statusDict;
+    }
+    PyObject * result = unmarshall->getPyObj();
+    unmarshall->reset();
+    py::object res = py::handle(result).cast<py::object>();
+    res.dec_ref();
+    return res;
+}
+
+PytoDdbRowPool::PytoDdbRowPool(MultithreadedTableWriter &writer)
+                                : writer_(writer)
+                                ,exitWhenEmpty_(false)
+                                ,pGilRelease_(NULL)
+                                ,convertingCount_(0)
+                                {
+    idle_.release();
+    thread_=new Thread(new ConvertExecutor(*this));
+    thread_->start();
+}
+
+PytoDdbRowPool::~PytoDdbRowPool(){
+    DLOG("~PytoDdbRowPool",rows_.size(),failedRows_.size());
+    if(!rows_.empty()||!failedRows_.empty()){
+        ProtectGil protectGil;
+        while(!rows_.empty()){
+            delete rows_.front();
+            rows_.pop();
+        }
+        while(!failedRows_.empty()){
+            delete failedRows_.front();
+            failedRows_.pop();
+        }
+    }
+}
+
+void PytoDdbRowPool::startExit(){
+    DLOG("startExit with",rows_.size(),failedRows_.size());
+    pGilRelease_=new py::gil_scoped_release;
+
+    exitWhenEmpty_ = true;
+    nonempty_.set();
+    thread_->join();
+}
+
+void PytoDdbRowPool::endExit(){
+    DLOG("endExit with",rows_.size(),failedRows_.size());
+    delete pGilRelease_;
+    pGilRelease_ = NULL;
+}
+
+void PytoDdbRowPool::convertLoop(){
+    vector<std::vector<py::object>*> convertRows;
+    while(writer_.hasError_ == false){
+        nonempty_.wait();
+        SemLock idleLock(idle_);
+        idleLock.acquire();
+        {
+            RECORDTIME("rowPool:ConvertExecutor");
+            LockGuard<Mutex> LockGuard(&mutex_);
+            size_t size = rows_.size();
+            if(size < 1){
+                if(exitWhenEmpty_)
+                    break;
+                nonempty_.reset();
+                continue;
+            }
+			if (size > 65535)
+				size = 65535;
+			convertRows.reserve(size);
+            while(!rows_.empty()){
+                convertRows.push_back(rows_.front());
+                rows_.pop();
+                if(convertRows.size() >= size)
+                    break;
+            }
+            convertingCount_=convertRows.size();
+        }
+        {
+            DLOG("convert start ",convertRows.size(),"/",rows_.size());
+            vector<vector<ConstantSP>*> insertRows;
+            insertRows.reserve(convertRows.size());
+            vector<ConstantSP> *pDdbRow = NULL;
+            try
+            {
+                ProtectGil protectGil;
+                const DATA_TYPE *pcolType = writer_.getColType();
+                int i, size;
+                for (auto &prow : convertRows)
+                {
+                    pDdbRow = new vector<ConstantSP>;
+                    size = prow->size();
+                    for (i = 0; i < size; i++)
+                    {
+                        pDdbRow->push_back(DdbPythonUtil::_toDolphinDBScalar(prow->at(i), pcolType[i]));
+                    }
+                    insertRows.push_back(pDdbRow);
+                    pDdbRow = NULL;
+                    delete prow; // must delete it in GIL lock
+                }
+            }catch (RuntimeException &e){
+                writer_.setError(ErrorCodeInfo::EC_InvalidObject, std::string("Data conversion error: ") + e.what());
+                delete pDdbRow;
+            }
+            if(!insertRows.empty()){
+                writer_.insertExecutor_->add(insertRows);
+            }
+            if (insertRows.size() != convertRows.size()){ // has error, rows left some
+                LockGuard<Mutex> LockGuard(&mutex_);
+                for(size_t i = insertRows.size(); i < convertRows.size(); i++){
+                    failedRows_.push(convertRows[i]);
+                }
+            }
+            DLOG("convert end ",insertRows.size(),failedRows_.size(),"/",rows_.size());
+            convertingCount_ = 0;
+            convertRows.clear();
+        }
+    }
+}
+
+void PytoDdbRowPool::getStatus(MultithreadedTableWriter::Status &status){
+    py::gil_scoped_release release;
+    writer_.getStatus(status);
+    LockGuard<Mutex> guard(&mutex_);
+    status.unsentRows += rows_.size() + convertingCount_;
+    status.sendFailedRows += failedRows_.size();
+    if(!status.threadStatus.empty()){
+        status.threadStatus.front().unsentRows += rows_.size() + convertingCount_;
+        status.threadStatus.front().sendFailedRows += failedRows_.size();
+    }
+}
+void PytoDdbRowPool::getUnwrittenData(vector<vector<py::object>*> &pyData,vector<vector<ConstantSP>*> &ddbData){
+    py::gil_scoped_release release;
+    writer_.getUnwrittenData(ddbData);
+    {
+        SemLock idleLock(idle_);
+        idleLock.acquire();
+        LockGuard<Mutex> LockGuard(&mutex_);
+        while(!failedRows_.empty()){
+            pyData.push_back(failedRows_.front());
+            failedRows_.pop();
+        }
+        while(!rows_.empty()){
+            pyData.push_back(rows_.front());
+            rows_.pop();
+        }
+    }
 }
 
 }

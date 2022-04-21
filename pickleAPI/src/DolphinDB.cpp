@@ -40,20 +40,8 @@ int min(INDEX a, int b) {
 #define APIMinVersionRequirement 210
 #define SYMBOLBASE_MAX_SIZE 1<<21
 
+#define RECORDTIME(name) //RecordTime _recordTime(name)
 #define DLOG //DLogger::Info
-
-class ProtectGil{
-public:
-    ProtectGil() {
-        gstate_ = PyGILState_Ensure();
-    }
-    ~ProtectGil() {
-        PyGILState_Release(gstate_);
-    }
-private:
-    PyGILState_STATE gstate_;
-};
-
 
 static inline uint32_t murmur32_16b (const unsigned char* key){
 	const uint32_t m = 0x5bd1e995;
@@ -110,8 +98,8 @@ public:
     void login(const string& userId, const string& password, bool enableEncryption);
     ConstantSP run(const string& script, int priority = 4, int parallelism = 2, int fetchSize = 0, bool clearMemory = false);
     ConstantSP run(const string& funcName, vector<ConstantSP>& args, int priority = 4, int parallelism = 2, int fetchSize = 0, bool clearMemory = false);
-    py::object runPy(const string& script, int priority = 4, int parallelism = 2, int fetchSize = 0, bool clearMemory = false);
-    py::object runPy(const string& funcName, vector<ConstantSP>& args, int priority = 4, int parallelism = 2, int fetchSize = 0, bool clearMemory = false);
+    py::object runPy(const string& script, int priority = 4, int parallelism = 2, int fetchSize = 0, bool clearMemory = false, bool pickleTableToList=false);
+    py::object runPy(const string& funcName, vector<ConstantSP>& args, int priority = 4, int parallelism = 2, int fetchSize = 0, bool clearMemory = false, bool pickleTableToList=false);
     ConstantSP upload(const string& name, const ConstantSP& obj);
     ConstantSP upload(vector<string>& names, vector<ConstantSP>& objs);
     void close();
@@ -125,7 +113,7 @@ public:
 
 private:
     ConstantSP run(const string& script, const string& scriptType, vector<ConstantSP>& args, int priority = 4, int parallelism = 2, int fetchSize = 0, bool clearMemory = false);
-    py::object runPy(const string& script, const string& scriptType, vector<ConstantSP>& args, int priority = 4, int parallelism = 2,int fetchSize = 0, bool clearMemory = false);
+    py::object runPy(const string& script, const string& scriptType, vector<ConstantSP>& args, int priority = 4, int parallelism = 2,int fetchSize = 0, bool clearMemory = false, bool pickleTableToList=false);
     bool connect();
     void login();
 
@@ -170,9 +158,14 @@ private:
 class DBConnectionPoolImpl{
 public:
     struct Task{
-        Task(const string& sc = "", int id = 0, int pr = 4, int pa = 2, bool clearM = false, bool isPy = true) : script(sc), identity(id), priority(pr), parallelism(pa), clearMemory(clearM), isPyTask(isPy){}
-        Task(const string& function, const vector<ConstantSP>& args, int id = 0, int pr = 4, int pa = 2, bool clearM = false, bool isPy = true)
-                : script(function), arguments(args), identity(id), priority(pr), parallelism(pa), clearMemory(clearM), isPyTask(isPy){ isFunc = true; }
+        Task(const string& sc = "", int id = 0, int pr = 4, int pa = 2, bool clearM = false, bool isPy = true, bool pickleTableToL=false,
+                                bool compressL=false,bool enablePickleL=true)
+                        : script(sc), identity(id), priority(pr), parallelism(pa), clearMemory(clearM), isPyTask(isPy)
+                        ,pickleTableToList(pickleTableToL),compress(compressL),enablePickle(enablePickleL){}
+        Task(const string& function, const vector<ConstantSP>& args, int id = 0, int pr = 4, int pa = 2, bool clearM = false,
+                            bool isPy = true,bool pickleTableToL=false,bool compressL=false,bool enablePickleL=true)
+                : script(function), arguments(args), identity(id), priority(pr), parallelism(pa), clearMemory(clearM), isPyTask(isPy),
+                pickleTableToList(pickleTableToL),compress(compressL),enablePickle(enablePickleL){ isFunc = true; }
         string script;
         vector<ConstantSP> arguments;
         int identity;
@@ -181,15 +174,22 @@ public:
         bool clearMemory;
         bool isFunc = false;
         bool isPyTask = true;
+        bool pickleTableToList=false;
+        bool compress=false;
+        bool enablePickle=true;
     };
 
-    DBConnectionPoolImpl(const string& hostName, int port, int threadNum = 10, const string& userId = "", const string& password = "", bool loadBalance = true, bool highAvailability = true, bool reConnectFlag = true, bool compress = false);
+    DBConnectionPoolImpl(const string& hostName, int port, int threadNum = 10, const string& userId = "", const string& password = "",
+            bool loadBalance = true, bool highAvailability = true, bool reConnectFlag = true, bool compress = false,bool enablePickle=true);
 
     ~DBConnectionPoolImpl(){
         shutDown();
-        // for(auto& work : workers_){
-        //     work->join();
-        // }
+        Task emptyTask;
+        for(int i=0; i < workers_.size(); i++)
+            queue_->push(emptyTask);
+        for(auto& work : workers_){
+            work->join();
+        }
     }
     void run(const string& script, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false){
         queue_->push(Task(script, identity, priority, parallelism, clearMemory, false));
@@ -200,13 +200,13 @@ public:
         queue_->push(Task(functionName, args, identity, priority, parallelism, clearMemory, false));
         taskStatus_.setResult(identity, TaskStatusMgmt::Result());
     }
-    void runPy(const string& script, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false){
-        queue_->push(Task(script, identity, priority, parallelism, clearMemory, true));
+    void runPy(const string& script, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false, bool pickleTableToList=false){
+        queue_->push(Task(script, identity, priority, parallelism, clearMemory, true,pickleTableToList));
         taskStatus_.setResult(identity, TaskStatusMgmt::Result());
     }
 
-    void runPy(const string& functionName, const vector<ConstantSP>& args, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false){
-        queue_->push(Task(functionName, args, identity, priority, parallelism, clearMemory, true));
+    void runPy(const string& functionName, const vector<ConstantSP>& args, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false, bool pickleTableToList=false){
+        queue_->push(Task(functionName, args, identity, priority, parallelism, clearMemory, true,pickleTableToList));
         taskStatus_.setResult(identity, TaskStatusMgmt::Result());
     }
 
@@ -775,7 +775,7 @@ void DBConnectionImpl::initialize() {
 #ifdef WINDOWS
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 1), &wsaData) != 0) {
-        throw IOException("Failed to initialize the windows socket.");
+        throw RuntimeException("Failed to initialize the windows socket.");
     }
 #endif
     initFormatters();
@@ -846,43 +846,43 @@ bool DBConnectionImpl::connect() {
     size_t actualLength;
     ret = conn->write(out.c_str(), out.size(), actualLength);
     if (ret != OK)
-        throw IOException("Couldn't send login message to the given host/port with IO error type " + std::to_string(ret));
+        throw RuntimeException("Couldn't send login message to the given host/port with IO error type " + std::to_string(ret));
 
     DataInputStreamSP in = new DataInputStream(conn);
     string line;
     ret = in->readLine(line);
     if (ret != OK)
-        throw IOException("Failed to read message from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read message from the socket with IO error type " + std::to_string(ret));
 
     vector<string> headers;
     Util::split(line.c_str(), ' ', headers);
     if (headers.size() != 3)
-        throw IOException("Received invalid header");
+        throw RuntimeException("Received invalid header");
     string sessionId = headers[0];
     int numObject = atoi(headers[1].c_str());
     bool remoteLittleEndian = (headers[2] != "0");
 
     if ((ret = in->readLine(line)) != OK)
-        throw IOException("Failed to read response message from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read response message from the socket with IO error type " + std::to_string(ret));
     if (line != "OK")
-		throw IOException("Server connection response: '" + line);
+		throw RuntimeException("Server connection response: '" + line);
 
     if (numObject == 1) {
         short flag;
         if ((ret = in->readShort(flag)) != OK)
-            throw IOException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
+            throw RuntimeException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
         DATA_FORM form = static_cast<DATA_FORM>(flag >> 8);
 
         ConstantUnmarshallFactory factory(in);
         ConstantUnmarshall* unmarshall = factory.getConstantUnmarshall(form);
         if (!unmarshall->start(flag, true, ret)) {
             unmarshall->reset();
-            throw IOException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
+            throw RuntimeException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
         }
         ConstantSP result = unmarshall->getConstant();
         unmarshall->reset();
         if (!result->getBool())
-            throw IOException("Failed to authenticate the user");
+            throw RuntimeException("Failed to authenticate the user");
     }
 
     conn_ = conn;
@@ -923,7 +923,7 @@ bool DBConnectionImpl::connect() {
             conn_->close();
             conn_.clear();
             isConnected_ = false;
-            throw IOException("Required Python API version at least "  + std::to_string(apiVersion) + ". Current Python API version is "+ std::to_string(APIMinVersionRequirement) +". Please update DolphinDB Python API. ");
+            throw RuntimeException("Required Python API version at least "  + std::to_string(apiVersion) + ". Current Python API version is "+ std::to_string(APIMinVersionRequirement) +". Please update DolphinDB Python API. ");
         }
         if(requiredVersion->size() >= 2 && requiredVersion->get(1)->getString() != ""){
             std::cout<<requiredVersion->get(1)->getString() <<std::endl;
@@ -948,7 +948,7 @@ void DBConnectionImpl::login() {
     args.push_back(new Bool(false));
     ConstantSP result = run("login", args);
     if (!result->getBool())
-        throw IOException("Failed to authenticate the user " + userId_);
+        throw RuntimeException("Failed to authenticate the user " + userId_);
 }
 
 ConstantSP DBConnectionImpl::run(const string& script, int priority, int parallelism, int fetchSize, bool clearMemory) {
@@ -960,14 +960,14 @@ ConstantSP DBConnectionImpl::run(const string& funcName, vector<ConstantSP>& arg
     return run(funcName, "function", args, priority, parallelism, fetchSize, clearMemory);
 }
 
-py::object DBConnectionImpl::runPy(const string &script, int priority, int parallelism, int fetchSize, bool clearMemory) {
+py::object DBConnectionImpl::runPy(const string &script, int priority, int parallelism, int fetchSize, bool clearMemory, bool pickleTableToList) {
     vector<ConstantSP> args;
-    return runPy(script, "script", args, priority, parallelism, fetchSize, clearMemory);
+    return runPy(script, "script", args, priority, parallelism, fetchSize, clearMemory,pickleTableToList);
 }
 
 py::object DBConnectionImpl::runPy(const string &funcName, vector<ConstantSP> &args, int priority, int parallelism,
-                                   int fetchSize, bool clearMemory) {
-    return runPy(funcName, "function", args, priority, parallelism, fetchSize, clearMemory);
+                                   int fetchSize, bool clearMemory, bool pickleTableToList) {
+    return runPy(funcName, "function", args, priority, parallelism, fetchSize, clearMemory,pickleTableToList);
 }
 
 ConstantSP DBConnectionImpl::upload(const string& name, const ConstantSP& obj) {
@@ -994,13 +994,18 @@ ConstantSP DBConnectionImpl::upload(vector<string>& names, vector<ConstantSP>& o
     return run(varNames, "variable", objs);
 }
 
-ConstantSP DBConnectionImpl::run(const string& script, const string& scriptType, vector<ConstantSP>& args, int priority, int parallelism, int fetchSize, bool clearMemory) {
-    DLOG("run1 ",script," start.");
+ConstantSP DBConnectionImpl::run(const string& script, const string& scriptType, vector<ConstantSP>& args, int priority, int parallelism,
+                                    int fetchSize, bool clearMemory) {
+    DLOG("run1 ",script," start");
     if (!isConnected_)
-        throw IOException("Couldn't send script/function to the remote host because the connection has been closed");
+        throw RuntimeException("Couldn't send script/function to the remote host because the connection has been closed");
 
     if(fetchSize > 0 && fetchSize < 8192)
-        throw IOException("fetchSize must be greater than 8192");
+        throw RuntimeException("fetchSize must be greater than 8192");
+    //force Python release GIL
+    SmartPointer<py::gil_scoped_release> pgilRelease;
+    if(PyGILState_Check() == 1)
+        pgilRelease = new py::gil_scoped_release;
     string body;
     int argCount = args.size();
     if (scriptType == "script")
@@ -1026,12 +1031,11 @@ ConstantSP DBConnectionImpl::run(const string& script, const string& scriptType,
     out.append(1, '\n');
     out.append(body);
 
-    DLOG("run2.");
     IO_ERR ret;
     if (argCount > 0) {
         for (int i = 0; i < argCount; ++i) {
             if (args[i]->containNotMarshallableObject()) {
-                throw IOException("The function argument or uploaded object is not marshallable.");
+                throw RuntimeException("The function argument or uploaded object is not marshallable.");
             }
         }
         DataOutputStreamSP outStream = new DataOutputStream(conn_);
@@ -1046,14 +1050,14 @@ ConstantSP DBConnectionImpl::run(const string& script, const string& scriptType,
             if (ret != OK) {
                 isConnected_ = false;
                 conn_.clear();
-                throw IOException("Couldn't send function argument to the remote host with IO error type " + std::to_string(ret));
+                throw RuntimeException("Couldn't send function argument to the remote host with IO error type " + std::to_string(ret));
             }
         }
         ret = outStream->flush();
         if (ret != OK) {
             isConnected_ = false;
             conn_.clear();
-            throw IOException("Failed to marshall code with IO error type " + std::to_string(ret));
+            throw RuntimeException("Failed to marshall code with IO error type " + std::to_string(ret));
         }
     } else {
         size_t actualLength;
@@ -1061,16 +1065,13 @@ ConstantSP DBConnectionImpl::run(const string& script, const string& scriptType,
         if (ret != OK) {
             isConnected_ = false;
             conn_.clear();
-            throw IOException("Couldn't send script/function to the remote host because the connection has been closed");
+            throw RuntimeException("Couldn't send script/function to the remote host because the connection has been closed");
         }
     }
-    DLOG("run3.");
 
     if(asynTask_){
         return new Void();
     }
-
-    DLOG("run4.");
     DataInputStreamSP in = new DataInputStream(conn_);
     if (littleEndian_ != (char)Util::isLittleEndian())
         in->enableReverseIntegerByteOrder();
@@ -1079,57 +1080,51 @@ ConstantSP DBConnectionImpl::run(const string& script, const string& scriptType,
     if ((ret = in->readLine(line)) != OK) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Failed to read response header from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read response header from the socket with IO error type " + std::to_string(ret));
     }
-    DLOG("run5.");
 
     vector<string> headers;
     Util::split(line.c_str(), ' ', headers);
     if (headers.size() != 3) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Received invalid header");
+        throw RuntimeException("Received invalid header");
     }
-    DLOG("run6.");
     sessionId_ = headers[0];
     int numObject = atoi(headers[1].c_str());
 
     if ((ret = in->readLine(line)) != OK) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Failed to read response message from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read response message from the socket with IO error type " + std::to_string(ret));
     }
-    DLOG("run7.");
 
     if (line != "OK") {
-        throw IOException("Server response: '" + line + "' script: '" + script + "'");
+        throw RuntimeException("Server response: '" + line + "' script: '" + script + "'");
     }
 
     if (numObject == 0) {
         return new Void();
     }
 
-    DLOG("run8.");
     //short flag;
     if ((ret = in->readShort(flag)) != OK) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
     }
-    DLOG("run9.");
 
     DATA_FORM form = static_cast<DATA_FORM>(flag >> 8);
     DATA_TYPE type = static_cast<DATA_TYPE >(flag & 0xff);
     if(fetchSize > 0 && form == DF_VECTOR && type == DT_ANY)
         return new BlockReader(in);
-    DLOG("run10.");
     ConstantUnmarshallFactory factory(in);
     ConstantUnmarshall* unmarshall = factory.getConstantUnmarshall(form);
     if (!unmarshall->start(flag, true, ret)) {
         unmarshall->reset();
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
     }
 
     ConstantSP result = unmarshall->getConstant();
@@ -1138,11 +1133,18 @@ ConstantSP DBConnectionImpl::run(const string& script, const string& scriptType,
 }
 
 py::object DBConnectionImpl::runPy(const string &script, const string &scriptType, vector<ConstantSP> &args,
-                                       int priority, int parallelism, int fetchSize, bool clearMemory) {
-    DLOG("runPy ",script," start.");
+                                       int priority, int parallelism, int fetchSize, bool clearMemory,
+                                       bool pickleTableToList) {
+    //RecordTime record("Db.runPy");
+    DLOG("runPy ",script," start argsize",args.size());
+    //force Python release GIL
     if (!isConnected_)
-        throw IOException("Couldn't send script/function to the remote host because the connection has been closed");
+        throw RuntimeException("Couldn't send script/function to the remote host because the connection has been closed");
+    SmartPointer<py::gil_scoped_release> pgilRelease;
+    if(PyGILState_Check() == 1)
+        pgilRelease = new py::gil_scoped_release;
 
+    //RecordTime record("Db.server");
     string body;
     int argCount = args.size();
     if (scriptType == "script")
@@ -1155,15 +1157,20 @@ py::object DBConnectionImpl::runPy(const string &script, const string &scriptTyp
     }
     string out("API " + sessionId_ + " ");
     out.append(Util::convert((int)body.size()));
-    int flag_ = 40; //32+8 means for python api
-    if(enablePickle_ == false)
-        flag_ = 0;
+    long long flag = 32;//32-API
+    if(enablePickle_ == false){
+        flag += 8;
+        if (compress_)
+            flag += 64;
+    }
     if(asynTask_)
-        flag_ += 4;
+        flag += 4;
     if(clearMemory)
-        flag_ += 16;
-    DLOG("runPy ",script," flag ", flag_, "\n");
-    out.append(" / " + std::to_string(flag_) + "_1_" + std::to_string(priority) + "_" + std::to_string(parallelism));
+        flag += 16;
+    if(pickleTableToList)
+        flag += (1<<15);
+    DLOG("runPy flag",flag,"enablePickle_",enablePickle_," pickleTableToList ", pickleTableToList,"compress",compress_);
+    out.append(" / " + std::to_string(flag) + "_1_" + std::to_string(priority) + "_" + std::to_string(parallelism));
     if(fetchSize > 0)
         out.append("__" + std::to_string(fetchSize));
 
@@ -1174,7 +1181,7 @@ py::object DBConnectionImpl::runPy(const string &script, const string &scriptTyp
     if (argCount > 0) {
         for (int i = 0; i < argCount; ++i) {
             if (args[i]->containNotMarshallableObject()) {
-                throw IOException("The function argument or uploaded object is not marshallable.");
+                throw RuntimeException("The function argument or uploaded object is not marshallable.");
             }
         }
         DataOutputStreamSP outStream = new DataOutputStream(conn_);
@@ -1189,27 +1196,27 @@ py::object DBConnectionImpl::runPy(const string &script, const string &scriptTyp
             if (ret != OK) {
                 isConnected_ = false;
                 conn_.clear();
-                throw IOException("Couldn't send function argument to the remote host with IO error type " + std::to_string(ret));
+                throw RuntimeException("Couldn't send function argument to the remote host with IO error type " + std::to_string(ret));
             }
         }
         ret = outStream->flush();
         if (ret != OK) {
             isConnected_ = false;
             conn_.clear();
-            throw IOException("Failed to marshall code with IO error type " + std::to_string(ret));
+            throw RuntimeException("Failed to marshall code with IO error type " + std::to_string(ret));
         }
     } else {
         size_t actualLength;
-        IO_ERR ret = conn_->write(out.c_str(), out.size(), actualLength);
+        ret = conn_->write(out.c_str(), out.size(), actualLength);
         if (ret != OK) {
             isConnected_ = false;
             conn_.clear();
-            throw IOException("Couldn't send script/function to the remote host because the connection has been closed");
+            throw RuntimeException("Couldn't send script/function to the remote host because the connection has been closed");
         }
     }
-    DLOG("runPy3.");
-    if(asynTask_)
+    if(asynTask_){
         return py::none();
+    }
     DataInputStreamSP in = new DataInputStream(conn_);
     if (littleEndian_ != (char)Util::isLittleEndian())
         in->enableReverseIntegerByteOrder();
@@ -1218,14 +1225,14 @@ py::object DBConnectionImpl::runPy(const string &script, const string &scriptTyp
     if ((ret = in->readLine(line)) != OK) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Failed to read response header from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read response header from the socket with IO error type " + std::to_string(ret));
     }
     vector<string> headers;
     Util::split(line.c_str(), ' ', headers);
     if (headers.size() != 3) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Received invalid header");
+        throw RuntimeException("Received invalid header");
     }
     sessionId_ = headers[0];
     int numObject = atoi(headers[1].c_str());
@@ -1233,80 +1240,77 @@ py::object DBConnectionImpl::runPy(const string &script, const string &scriptTyp
     if ((ret = in->readLine(line)) != OK) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Failed to read response message from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read response message from the socket with IO error type " + std::to_string(ret));
     }
     
     if (line != "OK") {
-        throw IOException("Server response: '" + line + "' script: '" + script + "'");
+        throw RuntimeException("Server response: '" + line + "' script: '" + script + "'");
     }
 
     if (numObject == 0) {
         return py::none();
     }
 
-    DLOG("runPy4.");
-
-    short flag;
-    if ((ret = in->readShort(flag)) != OK) {
+    short retFlag;
+    if ((ret = in->readShort(retFlag)) != OK) {
         isConnected_ = false;
         conn_.clear();
-        throw IOException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
     }
 
-    DLOG("runPy5.");
-    DATA_FORM form = static_cast<DATA_FORM>(flag >> 8);
+    DATA_FORM form = static_cast<DATA_FORM>(retFlag >> 8);
     if (form < 32) {
         ConstantSP result;
-        ConstantUnmarshallFactory factory(in);
-        ConstantUnmarshall* unmarshall = factory.getConstantUnmarshall(form);
-        if (!unmarshall->start(flag, true, ret)) {
+        {
+            //RecordTime record("Db.ConstUnma");
+            ConstantUnmarshallFactory factory(in);
+            ConstantUnmarshall* unmarshall = factory.getConstantUnmarshall(form);
+            if (!unmarshall->start(retFlag, true, ret)) {
+                unmarshall->reset();
+                isConnected_ = false;
+                conn_.clear();
+                throw RuntimeException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
+            }
+            result = unmarshall->getConstant();
             unmarshall->reset();
-            isConnected_ = false;
-            conn_.clear();
-            throw IOException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
         }
-        result = unmarshall->getConstant();
-        unmarshall->reset();
+        pgilRelease.clear();
+        //RecordTime record("Db.toPython");
         ProtectGil pgil;
-        return DdbPythonUtil::toPython(result);
+        //DLogger::Info("toPython tableToList",pickleTableToList);
+        DdbPythonUtil::ToPythonOption option;
+        option.table2List=pickleTableToList;
+        //RecordTime record("Db.toPython");
+        return DdbPythonUtil::toPython(result,false,&option);
     }
-    DLOG("runPy6.");
+    //RecordTime pickleRecord("Db.PickUnma");
+    //DLogger::Info("PickleTableToList",pickleTableToList);
+    pgilRelease.clear();
     ProtectGil pgil;
     std::unique_ptr<PickleUnmarshall> unmarshall(new PickleUnmarshall(in));
-    if (!unmarshall->start(flag, true, ret)) {
+    if (!unmarshall->start(retFlag, true, ret)) {
         unmarshall->reset();
         isConnected_ = false;
         conn_.clear();
         if(ret != OK)
-            throw IOException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
+            throw RuntimeException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
         else
             throw RuntimeException("Received invalid serialized data during deserialization!");
     }
-    DLOG("runPy7.");
     PyObject * result = unmarshall->getPyObj();
-    DLOG("runPy7.1.");
     if(form - 32 == DF_MATRIX) {
-        DLOG("runPy7.2.");
         PyObject * tem = PyList_GetItem(result, 0);
-        DLOG("runPy7.3.");
         py::array mat = py::handle(tem).cast<py::array>();
-        DLOG("runPy7.4.");
         py::object dtype = py::getattr(mat, "dtype");
-        DLOG("runPy7.5.",(std::string)py::str(dtype));
         if(UNLIKELY(dtype.equal(Preserved::npobject_))) {
-            DLOG("runPy7.6.");
             mat = mat.attr("transpose")();
             Py_IncRef(mat.ptr());
             PyList_SetItem(result, 0, mat.ptr());
-            DLOG("runPy7.7.");
         }
-        DLOG("runPy7.8.");
     }
-    DLOG("runPy8.");
     unmarshall->reset();
     py::object res = py::handle(result).cast<py::object>();
     res.dec_ref();
-    DLOG("runPy9.");
     return res;
 }
 
@@ -1406,8 +1410,9 @@ bool DBConnection::connected() {
 
 bool getNewLeader(const string& s, string& host, int& port) {
     string msg{s};
-    if (msg.substr(0, 11) == "<NotLeader>") {
-        msg = msg.substr(11);
+	int index=msg.find("<NotLeader>");
+    if (index!=string::npos) {
+        msg = msg.substr(index+11);
         auto v = Util::split(msg, ':');
         host = v[0];
         port = std::stoi(v[1]);
@@ -1438,7 +1443,7 @@ void DBConnection::switchDataNode(const string& err) {
                 }
                 else{
                     if (attempt >= 10)
-                        throw IOException("Failed to connect to host = " + host + ", port = " + std::to_string(port));
+                        throw RuntimeException("Failed to connect to host = " + host + ", port = " + std::to_string(port));
                 }
             } catch (IOException& ex) {
                 std::cerr << "Connect to node " << host << ":" << port << " came across a exception: " << ex.what()
@@ -1481,7 +1486,7 @@ void DBConnection::login(const string& userId, const string& password, bool enab
 ConstantSP DBConnection::run(const string& script, int priority, int parallelism, int fetchSize, bool clearMemory) {
     if (ha_) {
         try {
-            return conn_->run(script);
+            return conn_->run(script, priority, parallelism, fetchSize, clearMemory);
         } catch (IOException& e) {
             string host;
             int port;
@@ -1511,10 +1516,10 @@ ConstantSP DBConnection::run(const string& script, int priority, int parallelism
     }
 }
 
-py::object DBConnection::runPy(const string &script, int priority, int parallelism, int fetchSize, bool clearMemory) {
+py::object DBConnection::runPy(const string &script, int priority, int parallelism, int fetchSize, bool clearMemory, bool pickleTableToList) {
     if (ha_) {
         try {
-            return conn_->runPy(script);
+            return conn_->runPy(script, priority, parallelism, fetchSize, clearMemory, pickleTableToList);
         } catch (IOException& e) {
             string host;
             int port;
@@ -1527,7 +1532,7 @@ py::object DBConnection::runPy(const string &script, int priority, int paralleli
                         if(!connected() || getNewLeader(err, host, port)){
                             switchDataNode(err);
                         }
-                        return conn_->runPy(script);
+                        return conn_->runPy(script, priority, parallelism, fetchSize, clearMemory, pickleTableToList);
                     } catch (exception& e) {
                         if(i == maxRerunCnt_ - 1) {
                             throw;
@@ -1540,11 +1545,12 @@ py::object DBConnection::runPy(const string &script, int priority, int paralleli
             }
         }
     } else {
-        return conn_->runPy(script, priority, parallelism, fetchSize, clearMemory);
+        return conn_->runPy(script, priority, parallelism, fetchSize, clearMemory, pickleTableToList);
     }
 }
 
-ConstantSP DBConnection::run(const string& funcName, vector<dolphindb::ConstantSP>& args, int priority, int parallelism, int fetchSize, bool clearMemory) {
+ConstantSP DBConnection::run(const string& funcName, vector<dolphindb::ConstantSP>& args, int priority, int parallelism,
+                            int fetchSize, bool clearMemory) {
     if (ha_) {
         try {
             return conn_->run(funcName, args, priority, parallelism, fetchSize, clearMemory);
@@ -1577,10 +1583,10 @@ ConstantSP DBConnection::run(const string& funcName, vector<dolphindb::ConstantS
 }
 
 py::object DBConnection::runPy(const string &funcName, vector<ConstantSP> &args, int priority, int parallelism,
-                                     int fetchSize, bool clearMemory) {
+                                     int fetchSize, bool clearMemory, bool pickleTableToList) {
         if (ha_) {
         try {
-            return conn_->runPy(funcName, args, priority, parallelism, fetchSize, clearMemory);
+            return conn_->runPy(funcName, args, priority, parallelism, fetchSize, clearMemory,pickleTableToList);
         } catch (IOException& e) {
             string host;
             int port;
@@ -1593,7 +1599,7 @@ py::object DBConnection::runPy(const string &funcName, vector<ConstantSP> &args,
                         if(!connected() || getNewLeader(err, host, port)){
                             switchDataNode(err);
                         }
-                        return conn_->runPy(funcName, args, priority, parallelism, fetchSize, clearMemory);
+                        return conn_->runPy(funcName, args, priority, parallelism, fetchSize, clearMemory,pickleTableToList);
                     }catch(exception& e){
                         if(i == maxRerunCnt_ - 1)
                             throw;
@@ -1605,7 +1611,7 @@ py::object DBConnection::runPy(const string &funcName, vector<ConstantSP> &args,
             }
         }
     } else {
-        return conn_->runPy(funcName, args, priority, parallelism, fetchSize, clearMemory);
+        return conn_->runPy(funcName, args, priority, parallelism, fetchSize, clearMemory,pickleTableToList);
     }
 }
 
@@ -1669,44 +1675,34 @@ const string DBConnection::getSessionId() const {
 
 
 BlockReader::BlockReader(const DataInputStreamSP& in ) : in_(in), total_(0), currentIndex_(0){
-    DLOG("BlockReader ",this,".");
     int rows, cols;
     if(in->readInt(rows) != OK)
-        throw IOException("Failed to read rows for data block.");
+        throw RuntimeException("Failed to read rows for data block.");
     if(in->readInt(cols) != OK)
-        throw IOException("Faield to read col for data block.");
+        throw RuntimeException("Faield to read col for data block.");
     total_ = (long long)rows * (long long)cols;
-    DLOG("BlockReader ",this," size ",total_,".");
 }
 
 BlockReader::~BlockReader(){
-    DLOG("~BlockReader ",this,".");
 }
 
 ConstantSP BlockReader::read(){
-    DLOG("r1 ",this," ",currentIndex_,"/",total_,".");
     if(currentIndex_>=total_)
         return NULL;
     IO_ERR ret;
     short flag;
-    DLOG("r2.");
     if ((ret = in_->readShort(flag)) != OK)
-        throw IOException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
-    DLOG("r3.");
-
+        throw RuntimeException("Failed to read object flag from the socket with IO error type " + std::to_string(ret));
+    
     DATA_FORM form = static_cast<DATA_FORM>(flag >> 8);
     ConstantUnmarshallFactory factory(in_);
     ConstantUnmarshall* unmarshall = factory.getConstantUnmarshall(form);
     if (!unmarshall->start(flag, true, ret)) {
-        DLOG("r4.");
         unmarshall->reset();
-        throw IOException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
+        throw RuntimeException("Failed to parse the incoming object with IO error type " + std::to_string(ret));
     }
-    DLOG("r5.");
     ConstantSP result = unmarshall->getConstant();
-    DLOG("r6.");
     unmarshall->reset();
-    DLOG("r7.");
     currentIndex_ ++;
     return result;
 }
@@ -1720,13 +1716,14 @@ Domain::Domain(PARTITION_TYPE partitionType, DATA_TYPE partitionColType) : parti
 	partitionColCategory_ = Util::getCategory(partitionColType_);
 }
 
-DBConnectionPoolImpl::DBConnectionPoolImpl(const string& hostName, int port, int threadNum, const string& userId, const string& password, bool loadBalance, bool highAvailability, bool reConnectFlag, bool compress) :shutDownFlag_(
+DBConnectionPoolImpl::DBConnectionPoolImpl(const string& hostName, int port, int threadNum, const string& userId, const string& password,
+                            bool loadBalance, bool highAvailability, bool reConnectFlag, bool compress, bool enablePickle) :shutDownFlag_(
             false), queue_(new SynchronizedQueue<Task>){
     DBConnection::initialize();
     latch_ = new CountDownLatch(threadNum);
     if(!loadBalance){
         for(int i = 0 ;i < threadNum; i++){
-            SmartPointer<DBConnection> conn = new DBConnection(false, false, 7200, compress);
+            SmartPointer<DBConnection> conn = new DBConnection(false, false, 7200, compress, enablePickle);
             bool ret = conn->connect(hostName, port, userId, password, "", highAvailability);
             if(!ret)
                 throw RuntimeException("Failed to connect to " + hostName + ":" + std::to_string(port));
@@ -1736,7 +1733,7 @@ DBConnectionPoolImpl::DBConnectionPoolImpl(const string& hostName, int port, int
         }
     }
     else{
-        SmartPointer<DBConnection> entryPoint = new DBConnection(false, false, 7200, compress);
+        SmartPointer<DBConnection> entryPoint = new DBConnection(false, false, 7200, compress, enablePickle);
         bool ret = entryPoint->connect(hostName, port, userId, password);
         if(!ret)
             throw RuntimeException("Failed to connect to " + hostName + ":" + std::to_string(port));
@@ -1779,14 +1776,17 @@ void AsynWorker::run() {
         bool errorFlag = false;
         if (!queue_->blockingPop(task, 1000))
             continue;
+        if(task.script.empty())
+            continue;
         while(true) {
             try {
+                //RecordTime::printAllTime();
                 if(task.isPyTask){
                     if(task.isFunc){
-                        pyResult = conn_->runPy(task.script, task.arguments, task.priority, task.parallelism, 0, task.clearMemory);
+                        pyResult = conn_->runPy(task.script, task.arguments, task.priority, task.parallelism, 0, task.clearMemory,task.pickleTableToList);
                     }
                     else{
-                        pyResult = conn_->runPy(task.script, task.priority, task.parallelism, 0, task.clearMemory);
+                        pyResult = conn_->runPy(task.script, task.priority, task.parallelism, 0, task.clearMemory,task.pickleTableToList);
                     }
                 }
                 else {
@@ -1797,6 +1797,7 @@ void AsynWorker::run() {
                         result = conn_->run(task.script, task.priority, task.parallelism, 0, task.clearMemory);
                     }
                 }
+                DLOG(RecordTime::printAllTime());
                 break;
             }
             catch(IOException & ex){
@@ -1859,8 +1860,9 @@ py::object TaskStatusMgmt::getPyData(int identity){
     return re;
 }
 
-DBConnectionPool::DBConnectionPool(const string& hostName, int port, int threadNum, const string& userId, const string& password, bool loadBalance, bool highAvailability, bool reConnectFlag, bool compress){
-    pool_ = new DBConnectionPoolImpl(hostName, port, threadNum, userId, password, loadBalance, highAvailability, reConnectFlag, compress);
+DBConnectionPool::DBConnectionPool(const string& hostName, int port, int threadNum, const string& userId, const string& password, bool loadBalance,
+            bool highAvailability, bool reConnectFlag, bool compress,bool enablePickle){
+    pool_ = new DBConnectionPoolImpl(hostName, port, threadNum, userId, password, loadBalance, highAvailability, reConnectFlag, compress,enablePickle);
 }
 
 void DBConnectionPool::run(const string& script, int identity, int priority, int parallelism, int fetchSize, bool clearMemory){
@@ -1875,16 +1877,16 @@ void DBConnectionPool::run(const string& functionName, const vector<ConstantSP>&
     pool_->run(functionName, args, identity, priority, parallelism, fetchSize, clearMemory);
 }
 
-void DBConnectionPool::runPy(const string& script, int identity, int priority, int parallelism, int fetchSize, bool clearMemory){
+void DBConnectionPool::runPy(const string& script, int identity, int priority, int parallelism, int fetchSize, bool clearMemory, bool pickleTableToList){
     if(identity < 0)
         throw RuntimeException("Invalid identity: " + std::to_string(identity) + ". Identity must be a non-negative integer.");
-    pool_->runPy(script, identity, priority, parallelism, fetchSize, clearMemory);
+    pool_->runPy(script, identity, priority, parallelism, fetchSize, clearMemory,pickleTableToList);
 }
 
-void DBConnectionPool::runPy(const string& functionName, const vector<ConstantSP>& args, int identity, int priority, int parallelism, int fetchSize, bool clearMemory){
+void DBConnectionPool::runPy(const string& functionName, const vector<ConstantSP>& args, int identity, int priority, int parallelism, int fetchSize, bool clearMemory, bool pickleTableToList){
     if(identity < 0)
         throw RuntimeException("Invalid identity: " + std::to_string(identity) + ". Identity must be a non-negative integer.");
-    pool_->runPy(functionName, args, identity, priority, parallelism, fetchSize, clearMemory);
+    pool_->runPy(functionName, args, identity, priority, parallelism, fetchSize, clearMemory,pickleTableToList);
 }
 
 bool DBConnectionPool::isFinished(int identity){
@@ -2047,10 +2049,6 @@ int PartitionedTableAppender::append(TableSP table){
     return affected;
 }
 
-//int PartitionedTableAppender::appendDF(py::object table) {
-//    return append(DdbPythonUtil::toDolphinDB(table));
-//}
-
 void PartitionedTableAppender::checkColumnType(int col, DATA_CATEGORY category, DATA_TYPE type) {
 	DATA_CATEGORY expectCategory = columnCategories_[col];
 	//Add conversion
@@ -2120,10 +2118,6 @@ int AutoFitTableAppender::append(TableSP table){
     else
         return res->getInt();
 }
-
-//int AutoFitTableAppender::appendDF(py::object table) {
-//    return append(DdbPythonUtil::toDolphinDB(table));
-//}
 
 void AutoFitTableAppender::checkColumnType(int col, DATA_CATEGORY category, DATA_TYPE type) {
     DATA_CATEGORY expectCategory = columnCategories_[col];
@@ -2206,8 +2200,9 @@ int SymbolBase::find(const string& symbol){
 }
 
 int SymbolBase::findAndInsert(const string& symbol){
-    if(symbol == "")
-        throw RuntimeException("A symbol base key string can't be null.");
+	//remove following line to support empty symbol
+    //if(symbol == "")
+    //    throw RuntimeException("A symbol base key string can't be null.");
     if(symMap_.empty()){
         if(syms_.size() > 0 && syms_[0] != "")
             throw RuntimeException("A symbol base's first key must be empty string.");
@@ -2239,9 +2234,18 @@ int SymbolBase::findAndInsert(const string& symbol){
 
 DLogger::Level DLogger::minLevel_ = DLogger::LevelDebug;
 std::string DLogger::levelText_[] = { "Debug","Info","Warn","Error" };
-
+//std::string DLogger::logFilePath_="/tmp/ddb_python_api.log";
+std::string DLogger::logFilePath_;
 void DLogger::SetMinLevel(Level level) {
 	minLevel_ = level;
+}
+
+void DLogger::WriteLog(std::string &text){
+    puts(text.data());
+    if(logFilePath_.empty()==false){
+        text+="\n";
+        Util::writeFile(logFilePath_.data(),text.data(),text.length());
+    }
 }
 
 bool DLogger::FormatFirst(std::string &text, Level level) {
@@ -2249,12 +2253,12 @@ bool DLogger::FormatFirst(std::string &text, Level level) {
 		return false;
 	}
 	std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
-	text = text + Util::toMicroTimestampStr(now, true) + " : Thread[" +
-		std::to_string(Util::getCurThreadId()) + "] : " + levelText_[level] + " : ";
+	text = text + Util::toMicroTimestampStr(now, true) + ": [" +
+		std::to_string(Util::getCurThreadId()) + "] " + levelText_[level] + ":";
 	return true;
 }
 
-std::unordered_map<std::string, SmartPointer<RecordTime::Node>> RecordTime::codeMap_;
+std::unordered_map<std::string, RecordTime::Node*> RecordTime::codeMap_;
 Mutex RecordTime::mapMutex_;
 long RecordTime::lastRecordOrder_ = 0;
 RecordTime::RecordTime(const string &name) :
@@ -2268,8 +2272,8 @@ RecordTime::RecordTime(const string &name) :
 RecordTime::~RecordTime() {
 	long long diff = Util::getNanoEpochTime() - startTime_;
 	LockGuard<Mutex> LockGuard(&mapMutex_);
-	std::unordered_map<std::string, SmartPointer<RecordTime::Node>>::iterator iter = codeMap_.find(name_);
-	SmartPointer<RecordTime::Node> pnode;
+	std::unordered_map<std::string, RecordTime::Node*>::iterator iter = codeMap_.find(name_);
+	RecordTime::Node *pnode;
 	if (iter != codeMap_.end()) {
 		pnode = iter->second;
 	}
@@ -2282,43 +2286,56 @@ RecordTime::~RecordTime() {
 	if (pnode->minOrder > recordOrder_) {
 		pnode->minOrder = recordOrder_;
 	}
-	pnode->costTime.push_back(diff/1000.0f);
+	pnode->costTime.push_back(diff);
+	//pnode->startEndTime.push_back(startTime_);
 	//std::cout<<Util::getEpochTime()<<" "<<name_<<recordOrder_<<" end "<<pnode->costTime.size()<<" times cost "<<diff/1000000.0<<std::endl;
 }
 std::string RecordTime::printAllTime() {
 	std::string output;
 	LockGuard<Mutex> LockGuard(&mapMutex_);
-	std::vector<SmartPointer<RecordTime::Node>> nodes;
+	std::vector<RecordTime::Node*> nodes;
 	nodes.reserve(codeMap_.size());
-	for (std::unordered_map<std::string, SmartPointer<RecordTime::Node>>::iterator iter = codeMap_.begin(); iter != codeMap_.end(); iter++) {
+	for (std::unordered_map<std::string, RecordTime::Node*>::iterator iter = codeMap_.begin(); iter != codeMap_.end(); iter++) {
 		nodes.push_back(iter->second);
 	}
-	std::sort(nodes.begin(), nodes.end(), [](SmartPointer<RecordTime::Node> a, SmartPointer<RecordTime::Node> b) {
+	std::sort(nodes.begin(), nodes.end(), [](RecordTime::Node *a, RecordTime::Node *b) {
 		return a->minOrder < b->minOrder;
 	});
-	for (SmartPointer<RecordTime::Node> node : nodes) {
-		double sum = 0.0;//s
-		double max = 0.0, min = 0.0;
-		double second;
-		for (float one : node->costTime) {
-			second = one / 1000.0;//s
-			sum += second;
-			if (max < second) {
-				max = second;
+	static double ns2s = 1000000.0;
+	for (RecordTime::Node *node : nodes) {
+		long sumNsOverflow = 0;
+		long long sumNs = 0;//ns
+		double maxNs = 0, minNs = 0;
+		for (long long one : node->costTime) {
+			sumNs += one;
+			if (sumNs < 0) {
+				sumNsOverflow++;
+				sumNs = -(sumNs + LLONG_MAX);
 			}
-			if (min == 0 || min > second) {
-				min = second;
+			if (maxNs < one) {
+				maxNs = one;
+			}
+			if (minNs == 0 || minNs > one) {
+				minNs = one;
 			}
 		}
-		output = output + node->name + ": sum=" + std::to_string(sum) + " count=" + std::to_string(node->costTime.size()) +
-			" avg=" + std::to_string(sum / node->costTime.size()) +
-			" min=" + std::to_string(min) + " max=" + std::to_string(max) + "\n";
+		double sum = sumNsOverflow * (LLONG_MAX / ns2s) + sumNs / ns2s;
+		double min = minNs / ns2s;
+		double max = maxNs / ns2s;
+		output = output + node->name + ": sum = " + std::to_string(sum) + " count = " + std::to_string(node->costTime.size()) +
+			" avg = " + std::to_string(sum / node->costTime.size()) +
+			" min = " + std::to_string(min) + " max = " + std::to_string(max) + "\n";
+		delete node;
 	}
 	codeMap_.clear();
 	return output;
 }
 
-void ErrorCodeInfo::set(int code, const string &info) {
+void ErrorCodeInfo::set(int apiCode, const string &info){
+    set(formatApiCode(apiCode), info);
+}
+
+void ErrorCodeInfo::set(const string &code, const string &info) {
 	errorCode = code;
 	errorInfo = info;
 }

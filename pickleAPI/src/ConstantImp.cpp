@@ -2216,12 +2216,12 @@ int FastArrayVector::serializeFixedLength(char* buf, int bufSize, INDEX indexSta
 	int bytesSent = 0;
 	INDEX* pindex = index_->getIndexArray();
 
-	if(offset > 0){
+	if (offset > 0) {
 		INDEX rowStart = indexStart > 0 ? pindex[indexStart - 1] : 0;
 		int cellCount = pindex[indexStart] - rowStart;
-		int cellCountToSerialize = std::min(bufSize/baseUnitLength_, cellCount - offset);
+		int cellCountToSerialize = std::min(bufSize / baseUnitLength_, cellCount - offset);
 		bytesSent += value_->serialize(buf, bufSize, rowStart + offset, 0, cellCountToSerialize, tmpNumElement, tmpPartial);
-		if(cellCountToSerialize < cellCount - offset){
+		if (cellCountToSerialize < cellCount - offset) {
 			partial = offset + cellCountToSerialize;
 			return bytesSent;
 		}
@@ -2240,32 +2240,36 @@ int FastArrayVector::serializeFixedLength(char* buf, int bufSize, INDEX indexSta
 	INDEX prevStart = indexStart == 0 ? 0 : pindex[indexStart - 1];
 
 	//one block can't exceed 65535 rows
-	if(targetNumElement > 65535)
+	if (targetNumElement > 65535)
 		targetNumElement = 65535;
-	int i=0;
-	for(; i < targetNumElement && remainingBytes > 0; ++i){
+	int i = 0;
+	for (; i<targetNumElement && remainingBytes > 0; ++i) {
 		INDEX curStart = pindex[indexStart + i];
 		int curCount = curStart - prevStart;
 		prevStart = curStart;
+		int oldCountBytes = curCountBytes;
 		int bytesRequired = 0;
-
-		while(curCount > maxCount){
+		while (curCount > maxCount) {
 			bytesRequired += i * curCountBytes;
 			curCountBytes *= 2;
-			maxCount = std::min((long long)INT_MAX, (1ll<<(8 * curCountBytes)) - 1);
+			maxCount = std::min((long long)INT_MAX, (1ll << (8 * curCountBytes)) - 1);
 		}
 		bytesRequired += curCountBytes + curCount * baseUnitLength_;
 
-		if(bytesRequired > remainingBytes){
-			if(numElement == 0){
+		if (bytesRequired > remainingBytes) {
+			if (numElement == 0) {
 				partial = (remainingBytes - curCountBytes) / baseUnitLength_;
-				if(partial <= 0){
+				if (partial <= 0) {
 					partial = 0;
 				}
-				else{
+				else {
 					++i;
 					remainingBytes -= curCountBytes + partial * baseUnitLength_;
 				}
+			}
+			else {
+				if (oldCountBytes != curCountBytes)
+					curCountBytes = oldCountBytes;
 			}
 			break;
 		}
@@ -2275,41 +2279,41 @@ int FastArrayVector::serializeFixedLength(char* buf, int bufSize, INDEX indexSta
 		}
 	}
 
-	if(UNLIKELY(i==0))
+	if (UNLIKELY(i == 0))
 		return bytesSent;
 
 	//output the block header
 	unsigned short rows = i;
 	memcpy(buf, &rows, 2);
-	memset(buf+2,curCountBytes, 1);
-	memset(buf+3, 0, 1);
+	memset(buf + 2, curCountBytes, 1);
+	memset(buf + 3, 0, 1);
 	buf += 4;
 	bytesSent += 4;
 	bufSize -= 4;
 
 	//output array of counts
 	prevStart = indexStart == 0 ? 0 : pindex[indexStart - 1];
-	if(curCountBytes == 1){
-		for(int k=0; k<i; ++k){
+	if (curCountBytes == 1) {
+		for (int k = 0; k<i; ++k) {
 			INDEX curStart = pindex[indexStart + k];
 			unsigned char curCount = curStart - prevStart;
 			memcpy(buf + k, &curCount, 1);
 			prevStart = curStart;
 		}
 	}
-	else if(curCountBytes == 2){
-		for(int k=0; k<i; ++k){
+	else if (curCountBytes == 2) {
+		for (int k = 0; k<i; ++k) {
 			INDEX curStart = pindex[indexStart + k];
 			unsigned short curCount = curStart - prevStart;
-			memcpy(buf + 2*k, &curCount, 2);
+			memcpy(buf + 2 * k, &curCount, 2);
 			prevStart = curStart;
 		}
 	}
 	else {
-		for(int k=0; k<i; ++k){
+		for (int k = 0; k<i; ++k) {
 			INDEX curStart = pindex[indexStart + k];
 			unsigned int curCount = curStart - prevStart;
-			memcpy(buf +4* k, &curCount, 4);
+			memcpy(buf + 4 * k, &curCount, 4);
 			prevStart = curStart;
 		}
 	}
@@ -2319,19 +2323,22 @@ int FastArrayVector::serializeFixedLength(char* buf, int bufSize, INDEX indexSta
 
 	//output array of data
 	prevStart = indexStart == 0 ? 0 : pindex[indexStart - 1];
-	INDEX count = (indexStart + numElement == 0 ? 0 : pindex[indexStart + numElement - 1]) + partial - prevStart;
-	int bytes;
-	bytes = value_->serialize(buf, bufSize, prevStart, 0, count, tmpNumElement, tmpPartial);
-	//if(offset > 0)
-	//	bytes = value_->serialize(buf, bufSize, prevStart, 0, count, tmpNumElement, tmpPartial);
-	//else
-	//	bytes = value_->serialize(buf, bufSize, prevStart, 0, tmpNumElement, tmpPartial);
-	// assert(bytes == count * baseUnitLength_);
+	INDEX curStart = indexStart + numElement - (offset > 0);
+	INDEX count = (curStart == 0 ? 0 : pindex[curStart - 1]) + partial - prevStart;
+	int bytes = value_->serialize(buf, bufSize, prevStart, 0, count, tmpNumElement, tmpPartial);
+	//assert(bytes == count * baseUnitLength_);
 	return bytesSent + bytes;
 }
 
+
 ConstantSP FastArrayVector::getValue() const {
 	ConstantSP newIndex = Util::createIndexVector(size_, true);
+	newIndex->assign(index_);
+	return new FastArrayVector(newIndex, ((Constant*)value_.get())->getValue());
+}
+
+ConstantSP FastArrayVector::getValue(INDEX capacity) const {
+	ConstantSP newIndex = Util::createIndexVector(size_, true, capacity);
 	newIndex->assign(index_);
 	return new FastArrayVector(newIndex, ((Constant*)value_.get())->getValue());
 }
@@ -2590,6 +2597,30 @@ void FastArrayVector::reverse() {
 
 bool FastArrayVector::append(const ConstantSP& value){
 	return append(value, 0, value->size());
+}
+
+// VectorSP FastArrayVector::getFlatValueArray(){
+// 	VectorSP pFlatValue = Util::createVector(value_->getType(),0,value_->size());
+// 	size_t size = rows();
+// 	for(size_t i=0; i<size; i++){
+// 		pFlatValue->append(get(i));
+// 	}
+// 	return pFlatValue;
+// }
+
+INDEX FastArrayVector::checkVectorSize(){
+	INDEX indexSize = index_->size();
+	if(indexSize < 1)
+		return 0;
+	INDEX* pIndex = (INDEX*)index_->getDataArray();
+	INDEX colSize = pIndex[0];
+	INDEX lastCount = colSize;
+	for(INDEX i=1; i < indexSize; i++){
+		if((pIndex[i] - lastCount) != colSize)
+			return -1;
+		lastCount = pIndex[i];
+	}
+	return colSize;
 }
 
 bool FastArrayVector::append(const ConstantSP& value, INDEX count) {
