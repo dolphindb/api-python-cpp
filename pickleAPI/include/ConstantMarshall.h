@@ -45,7 +45,7 @@ public:
 	virtual IO_ERR flush();
 
 protected:
-	short encodeFlag(const ConstantSP& target, COMPRESS_METHOD compress = COMPRESS_METHOD::COMPRESS_NONE);
+	short encodeFlag(const ConstantSP& target, bool compress = false);
 protected:
 	BufferWriter<DataOutputStreamSP> out_;
 	ConstantSP target_;
@@ -136,7 +136,7 @@ public:
 	virtual bool start(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 	virtual void reset();
 private:
-	bool sendMeta(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, IO_ERR& ret);
+	bool sendMeta(const char* requestHeader, size_t headerSize, const ConstantSP& target, bool blocking, bool compress, IO_ERR& ret);
 
 private:
 	int columnNamesSent_;

@@ -14,8 +14,6 @@ import sys
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-import warnings
-warnings.filterwarnings('ignore',category=FutureWarning)
 sys.path.append(os.path.dirname(__file__))
 import dolphindbcpp  as ddbcpp
 
@@ -32,8 +30,8 @@ def start_thread_loop(loop):
     loop.run_forever()
 
 class DBConnectionPool(object):
-    def __init__(self, host, port, threadNum=10, userid="", password="", loadBalance=False, highAvailability=False, reConnectFlag=True,compress=False):
-        self.pool = ddbcpp.dbConnectionPoolImpl(host, port, threadNum, userid, password, loadBalance, highAvailability, reConnectFlag,compress)
+    def __init__(self, host, port, threadNum=10, userid="", password="", loadBalance=False, highAvailability=False, reConnectFlag=True,compress=False,enablePickle=True):
+        self.pool = ddbcpp.dbConnectionPoolImpl(host, port, threadNum, userid, password, loadBalance, highAvailability, reConnectFlag,compress,enablePickle)
         self.host = host
         self.port = port
         self.userid = userid
@@ -43,12 +41,14 @@ class DBConnectionPool(object):
         self.loop = None
         self.thread = None
 
-    async def run(self, script, clearMemory = True):
+    async def run(self, script, *args, **kwargs):
         self.mutex.acquire()
         self.taskId = self.taskId + 1
         id = self.taskId
         self.mutex.release()
-        self.pool.run(script, id, clearMemory)
+        if "clearMemory" not in kwargs.keys():
+            kwargs["clearMemory"] = True
+        self.pool.run(script, id, *args, **kwargs)
         while True:
             isFinished = self.pool.isFinished(id)
             if(isFinished == 0):
@@ -77,7 +77,7 @@ class DBConnectionPool(object):
         if(self.loop is None):
             self.startLoop()
             #raise Exception("Event loop is not started yet, please run startLoop() first!")
-        task = asyncio.run_coroutine_threadsafe(self.run(script, clearMemory), self.loop)
+        task = asyncio.run_coroutine_threadsafe(self.run(script, clearMemory=clearMemory), self.loop)
         return task
 
     async def stopLoop(self):
@@ -113,7 +113,7 @@ class session(object):
     3: Table object returns  a pandas data frame
     4: Matrix object returns a numpy array
     """
-    def __init__(self, host=None, port=None, userid="", password="",enableSSL=False, enableASYN=False, keepAliveTime=30, enableChunkGranularitConfig=False,compress=False, enablePickle=True):
+    def __init__(self, host=None, port=None, userid="", password="",enableSSL=False, enableASYN=False, keepAliveTime=30, enableChunkGranularityConfig=False,compress=False, enablePickle=True):
         self.cpp = ddbcpp.sessionimpl(enableSSL, enableASYN, keepAliveTime,compress,enablePickle)
         self.host = host
         self.port = port
@@ -121,7 +121,7 @@ class session(object):
         self.password=password
         self.mutex = Lock()
         self.enableEncryption = True
-        self.enableChunkGranularitConfig = enableChunkGranularitConfig
+        self.enableChunkGranularityConfig = enableChunkGranularityConfig
         self.enablePickle = enablePickle
         if self.host is not None and self.port is not None:
             self.connect(host, port, userid, password)
@@ -397,7 +397,7 @@ class session(object):
             dbstr += ",engine='"+engine+"'"
         if atomic is not None:
             dbstr += ",atomic='"+atomic+"'"
-        if self.enableChunkGranularitConfig == True :
+        if self.enableChunkGranularityConfig == True :
             dbstr += ",chunkGranularity='"+chunkGranularity+"'"
         
         dbstr+=")"
@@ -503,7 +503,9 @@ class session(object):
         if partitions is None:
             partitions = []
         return Table(dbPath=dbPath, data=data,  tableAliasName=tableAliasName, inMem=inMem, partitions=partitions, s=self)
-
+    
+    def loadPickleFile(self, filePath):
+        return self.cpp.loadPickleFile(filePath)
     
 
 class BlockReader(object):
@@ -550,3 +552,106 @@ class BatchTableWriter(object):
         self.writer.removeTable(dbPath, tableName)
     def insert(self, dbPath="", tableName="", *args):
         self.writer.insert(dbPath, tableName, *args)
+
+class ErrorCodeInfo(object):
+    def __init__(self,errorCode=None,errorInfo=None):
+        self.errorCode=errorCode
+        self.errorInfo=errorInfo
+    def __repr__(self):
+        errorCodeText = ""
+        if self.hasError():
+            errorCodeText = self.errorCode
+        else:
+            errorCodeText = None
+        outStr="errorCode: %s\n" % errorCodeText
+        outStr+=" errorInfo: %s\n" % self.errorInfo
+        outStr += object.__repr__(self)
+        return outStr
+    def hasError(self):
+        return self.errorCode is not None and len(self.errorCode) > 0
+    def succeed(self):
+        return self.errorCode is None or len(self.errorCode) < 1
+
+class MultithreadedTableWriterThreadStatus(object):
+    def __init__(self,threadId=None):
+        self.threadId=threadId
+        self.sentRows=None
+        self.unsentRows=None
+        self.sendFailedRows=None
+
+class MultithreadedTableWriterStatus(ErrorCodeInfo):
+    def __init__(self):
+        self.isExiting=None
+        self.sentRows=None
+        self.unsentRows=None
+        self.sendFailedRows=None
+        self.threadStatus=[]
+    def update(self,statusDict):
+        threadStatusDict=statusDict["threadStatus"]
+        del statusDict["threadStatus"]
+        self.__dict__.update(statusDict)
+        for oneThreadStatusDict in threadStatusDict:
+            oneThreadStatus=MultithreadedTableWriterThreadStatus()
+            oneThreadStatus.__dict__.update(oneThreadStatusDict)
+            self.threadStatus.append(oneThreadStatus)
+    
+    def __repr__(self):
+        errorCodeText = ""
+        if self.hasError():
+            errorCodeText = self.errorCode
+        else:
+            errorCodeText = None
+        outStr="%-14s: %s\n" % ("errorCode",errorCodeText)
+        if self.errorInfo is not None:
+            outStr += " %-14s: %s\n" % ("errorInfo",self.errorInfo)
+        if self.isExiting is not None:
+            outStr += " %-14s: %s\n" % ("isExiting",self.isExiting)
+        if self.sentRows is not None:
+            outStr += " %-14s: %s\n" % ("sentRows",self.sentRows)
+        if self.unsentRows is not None:
+            outStr += " %-14s: %s\n" % ("unsentRows",self.unsentRows)
+        if self.sendFailedRows is not None:
+            outStr += " %-14s: %s\n" % ("sendFailedRows",self.sendFailedRows)
+        if self.threadStatus is not None:
+            outStr += " %-14s: \n" % "threadStatus"
+            outStr += " \tthreadId\tsentRows\tunsentRows\tsendFailedRows\n"
+            for thread in self.threadStatus:
+                outStr+="\t"
+                if thread.threadId is not None:
+                    outStr+="%8d"%thread.threadId
+                outStr+="\t"
+                if thread.sentRows is not None:
+                    outStr+="%8d"%thread.sentRows
+                outStr+="\t"
+                if thread.unsentRows is not None:
+                    outStr+="%10d"%thread.unsentRows
+                outStr+="\t"
+                if thread.sendFailedRows is not None:
+                    outStr+="%14d"%thread.sendFailedRows
+                outStr+="\n"
+        outStr += object.__repr__(self)
+        return outStr
+
+class MultithreadedTableWriter(object):
+    def __init__(self, host, port, userId, password, dbPath, tableName, useSSL, enableHighAvailability = False,
+                            highAvailabilitySites = [], batchSize = 1, throttle = 0.01,threadCount = 1,
+                            partitionCol ="", compressMethods = []):
+        self.writer = ddbcpp.multithreadedTableWriter(host, port, userId, password, dbPath, tableName, useSSL,
+                            enableHighAvailability, highAvailabilitySites, batchSize, throttle,threadCount,
+                            partitionCol, compressMethods)
+    def getStatus(self):
+        status=MultithreadedTableWriterStatus()
+        status.update(self.writer.getStatus())
+        return status
+    def getUnwrittenData(self):
+        return self.writer.getUnwrittenData()
+    def insert(self, *args):
+        errorCodeInfo=ErrorCodeInfo()
+        errorCodeInfo.__dict__.update(self.writer.insert(*args))
+        return errorCodeInfo
+    def insertUnwrittenData(self, unwrittenData):
+        errorCodeInfo=ErrorCodeInfo()
+        errorCodeInfo.__dict__.update(self.writer.insertUnwrittenData(unwrittenData))
+        return errorCodeInfo
+    def waitForThreadCompletion(self):
+        self.writer.waitForThreadCompletion()

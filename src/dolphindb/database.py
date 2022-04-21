@@ -12,17 +12,28 @@ class Database(object):
     def _getDbName(self):
         return self.__dbName
 
-    def createTable(self, table=None, tableName=None):
+    def createTable(self, table=None, tableName=None, sortColumns=None):
         if not isinstance(table, Table):
             raise RuntimeError("Only DolphinDB Table object is accepted")
         
         tHandle = table._getTableName()
         ctHandle = _generate_handle()
-        runstr = ctHandle + "=" + self.__dbName + ".createTable(" + tHandle + "," + "`" + tableName + ");"
+        runstr = ctHandle + "=" + self.__dbName + ".createTable(" + tHandle + "," + "`" + tableName
+
+        if sortColumns is not None:
+            if type(sortColumns) == str:
+                runstr += ",sortColumns=`"+sortColumns
+            elif type(sortColumns) == list:
+                runstr += ",sortColumns="
+                for key in sortColumns:
+                    runstr += "`"+key
+
+        runstr += ");"
+
         self.__session.run(runstr)
         return self.__session.loadTable(ctHandle)
 
-    def createPartitionedTable(self, table=None, tableName=None, partitionColumns=None, compressMethods=[], sortColumns=None, keepDuplicates=""):
+    def createPartitionedTable(self, table=None, tableName=None, partitionColumns=None, compressMethods={}, sortColumns=None, keepDuplicates=""):
         if not isinstance(table, Table):
             raise RuntimeError("Only DolphinDB Table object is accepted")
         
@@ -40,19 +51,33 @@ class Database(object):
             raise RuntimeError("Only String or List of String is accepted for partitionColumns")
 
         runstr = cptHandle + "=" + self.__dbName + ".createPartitionedTable(" + tHandle + "," + "`" + tableName + ","  + partitionColumns_str
+
         if len(compressMethods) > 0 :
-            runstr += ",compressMethods=["
-            for key in compressMethods:
-                runstr += "'"+key+"',"
-            runstr = runstr[:-1]+"]"
-        if sortColumns is not None :
+            runstr += ",compressMethods={"
+            for key, value in compressMethods.items():
+                runstr += key+":'"+value+"',"
+            runstr = runstr[:-1]+"}"
+        if sortColumns is not None:
             if type(sortColumns) == str:
-                runstr += ",sortColumns='"+sortColumns+"'"
+                runstr += ",sortColumns=`"+sortColumns
             elif type(sortColumns) == list:
-                runstr += ",sortColumns=["
+                runstr += ",sortColumns="
                 for key in sortColumns:
-                    runstr += "'"+key+"',"
-                runstr = runstr[:-1]+"]"
+                    runstr += "`"+key
+
+        # if len(compressMethods) > 0 :
+        #     runstr += ",compressMethods=["
+        #     for key in compressMethods:
+        #         runstr += "'"+key+"',"
+        #     runstr = runstr[:-1]+"]"
+        # if sortColumns is not None :
+        #     if type(sortColumns) == str:
+        #         runstr += ",sortColumns='"+sortColumns+"'"
+        #     elif type(sortColumns) == list:
+        #         runstr += ",sortColumns=["
+        #         for key in sortColumns:
+        #             runstr += "'"+key+"',"
+        #         runstr = runstr[:-1]+"]"
 
         if len(keepDuplicates) > 0 :
             runstr += ",keepDuplicates="+keepDuplicates

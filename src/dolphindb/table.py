@@ -991,6 +991,16 @@ class Table(object):
         query = self.showSQL()
         df = self.__session.run(query)  # type: DataFrame
         return df
+    def toList(self):
+        """
+        execute sql query on remote dolphindb server
+
+        :return: query result as a list object
+        """
+        self._init_schema()
+        query = self.showSQL()
+        list = self.__session.run(query,pickleTableToList=True)  # type: DataFrame
+        return list
 
     toDataFrame = toDF
 
@@ -1148,7 +1158,7 @@ class TableUpdate(object):
         query = self.showSQL()
         #print(query)
         self.__t.session().run(query)  # type: DataFrame
-        return self.__t
+        return Table(data=self.__t.tableName(), s=self.__t.session())
 
     def toDF(self):
         """

@@ -164,6 +164,18 @@ private:
 	unsigned char uuid_[16];
 };
 
+class ProtectGil{
+public:
+    ProtectGil() {
+        gstate_ = PyGILState_Ensure();
+    }
+    ~ProtectGil() {
+        PyGILState_Release(gstate_);
+    }
+private:
+    PyGILState_STATE gstate_;
+};
+
 struct GuidHash {
 	uint64_t operator()(const Guid& guid) const;
 };
@@ -710,14 +722,14 @@ public:
 	 * exception.
 	 */
 	ConstantSP run(const string& script, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory=false);
-    py::object runPy(const string& script, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory=false);
+    py::object runPy(const string& script, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory=false,bool pickleTableToList=false);
 	/**
 	 * Run the given function on the DolphinDB server using the local objects as the arguments
 	 * for the function and return the result to the client. If nothing returns, the function
 	 * returns a void object. If error is raised on the server, the function throws an exception.
 	 */
 	ConstantSP run(const string& funcName, vector<ConstantSP>& args, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory=false);
-    py::object runPy(const string& funcName, vector<ConstantSP>& args, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory=false);
+    py::object runPy(const string& funcName, vector<ConstantSP>& args, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory=false,bool pickleTableToList=false);
 	/**
 	 * upload a local object to the DolphinDB server and assign the given name in the session.
 	 */
@@ -791,13 +803,14 @@ private:
 
 class EXPORT_DECL DBConnectionPool{
 public:
-    DBConnectionPool(const string& hostName, int port, int threadNum = 10, const string& userId = "", const string& password = "", bool loadBalance = false, bool highAvailability = false,  bool reConectFlag = true, bool compress = false);
+    DBConnectionPool(const string& hostName, int port, int threadNum = 10, const string& userId = "", const string& password = "",
+					bool loadBalance = false, bool highAvailability = false,  bool reConectFlag = true, bool compress = false, bool enablePickle=true);
     
 	void run(const string& script, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false);
     
 	void run(const string& functionName, const vector<ConstantSP>& args, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false);
-    void runPy(const string& script, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false);
-    void runPy(const string& functionName, const vector<ConstantSP>& args, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false);
+    void runPy(const string& script, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false, bool pickleTableToList=false);
+    void runPy(const string& functionName, const vector<ConstantSP>& args, int identity, int priority=4, int parallelism=2, int fetchSize=0, bool clearMemory = false, bool pickleTableToList=false);
     bool isFinished(int identity);
     
 	ConstantSP getData(int identity);
@@ -822,8 +835,6 @@ public:
 	PartitionedTableAppender(string dbUrl, string tableName, string partitionColName, string appendFunction, DBConnectionPool& pool);
 
 	int append(TableSP table);
-
-	//int appendDF(py::object table);
 
 private:
  	void init(string dbUrl, string tableName, string partitionColName, string appendFunction);
@@ -850,7 +861,6 @@ public:
 	AutoFitTableAppender(string dbUrl, string tableName, DBConnection& conn);
 
 	int append(TableSP table);
-	//int appendDF(py::object table);
 
 private:
 	void checkColumnType(int col, DATA_CATEGORY category, DATA_TYPE type);
@@ -868,21 +878,36 @@ class EXPORT_DECL ErrorCodeInfo {
 public:
 	enum ErrorCode {
 		EC_None = 0,
-		EC_InvalidObject,
-		EC_InvalidParameter,
-		EC_InvalidTable,
-		EC_InvalidColumnType,
-		EC_Server,
-		EC_UserBreak,
-		EC_DestroyedObject,
-		EC_Exception,
+		EC_InvalidObject=1,
+		EC_InvalidParameter=2,
+		EC_InvalidTable=3,
+		EC_InvalidColumnType=4,
+		EC_Server=5,
+		EC_UserBreak=6,
+		EC_DestroyedObject=7,
+		EC_Other=8,
 	};
 	ErrorCodeInfo() {
-		errorCode = 0;
 	}
-	void set(int code, const string &info);
+	void clearError(){
+		errorCode.clear();
+	}
+	bool hasError(){
+		return errorCode.empty() == false;
+	}
+	bool succeed() {
+		return errorCode.empty();
+	}
+	static string formatApiCode(int code){
+		if(code != EC_None)
+			return "A" + std::to_string(code);
+		else
+			return "";
+	}
+	void set(int apiCode, const string &info);
+	void set(const string &code, const string &info);
 	void set(const ErrorCodeInfo &src);
-	int errorCode;
+	string errorCode;
 	string errorInfo;
 };
 
@@ -899,11 +924,11 @@ private:
 	struct Node {
 		string name;
 		long minOrder;
-		std::vector<float> costTime;//ms
+		std::vector<long long> costTime;//ns
 	};
 	static long lastRecordOrder_;
 	static Mutex mapMutex_;
-	static std::unordered_map<std::string, SmartPointer<RecordTime::Node>> codeMap_;
+	static std::unordered_map<std::string, RecordTime::Node*> codeMap_;
 };
 
 class EXPORT_DECL DLogger {
@@ -918,7 +943,6 @@ public:
 	template<typename... TArgs>
 	static void Info(TArgs... args) {
 		std::string text;
-		std::cout << "Info";
 		Write(text, LevelInfo, 0, args...);
 	}
 	template<typename... TArgs>
@@ -936,24 +960,31 @@ public:
 		std::string text;
 		Write(text, LevelError, 0, args...);
 	}
+	static void SetLogFilePath(const std::string &filepath){ logFilePath_=filepath; }
 	static void SetMinLevel(Level level);
 private:
 	static Level minLevel_;
+	static std::string logFilePath_;
 	static std::string levelText_[LevelCount];
 	static bool FormatFirst(std::string &text, Level level);
+	static void WriteLog(std::string &text);
 	template<typename TA, typename... TArgs>
 	static void Write(std::string &text, Level level, int deepth, TA first, TArgs... args) {
 		if (deepth == 0) {
 			if (FormatFirst(text, level) == false)
 				return;
 		}
-		text += Create(first);
+		text += " " + Create(first);
 		Write(text, level, deepth + 1, args...);
 	}
 	template<typename TA>
 	static void Write(std::string &text, Level level, int deepth, TA first) {
-		text += Create(first);
-		std::cout << text << std::endl;
+		if (deepth == 0) {
+			if (FormatFirst(text, level) == false)
+				return;
+		}
+		text += " " + Create(first);
+		WriteLog(text);
 	}
 	static std::string Create(const char *value) {
 		std::string str(value);
@@ -967,6 +998,9 @@ private:
 	}
 	static std::string Create(int value) {
 		return std::to_string(value);
+	}
+	static std::string Create(char value) {
+		return std::string(&value, 1);
 	}
 	static std::string Create(unsigned value) {
 		return std::to_string(value);

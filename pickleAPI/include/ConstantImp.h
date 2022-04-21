@@ -1453,6 +1453,7 @@ public:
 	virtual bool  		  remove(INDEX count);
 	virtual bool 	      remove(const ConstantSP& index);
 	virtual ConstantSP    getValue() const;
+	virtual ConstantSP    getValue(INDEX capacity) const;
 	virtual INDEX 		  getCapacity() const { return index_->getCapacity(); }
 	virtual short 		  getUnitLength() const { return value_->getUnitLength(); }
 	virtual ConstantSP    getInstance(INDEX size) const;
@@ -1488,6 +1489,9 @@ public:
 	virtual IO_ERR deserialize(DataInputStream* in, INDEX indexStart, INDEX targetNumElement, INDEX& numElement);
 	virtual INDEX rows() const { return index_->rows(); }
 	virtual INDEX columns() const { return value_->rows(); }
+	INDEX		  checkVectorSize();//<0: The vectors in the array vector are of different size. >=0: The vectors are of the same size {x}.
+	VectorSP	  getFlatValueArray(){ return value_; }
+	void reserveValue(INDEX capacity) { value_->reserve(capacity); }
 
 private:
 	int 		serializeFixedLength(char* buf, int bufSize, INDEX indexStart, int offset, int targetNumElement, int& numElement, int& partial) const;

@@ -117,10 +117,10 @@ for pkg_name in old_packages:
     packages.append(pkg_name)
 
 setuptools.setup(name='dolphindb',
-                 version='1.30.16.1',
+                 version='1.30.17.2',
                  install_requires=[
                      "future",
-                     "numpy>=1.18,<=1.19.3",
+                     "numpy>=1.18,<=1.22.3",
                      "pandas>=0.25.1,!=1.3.0"
                  ],
                  author='DolphinDB, Inc.',

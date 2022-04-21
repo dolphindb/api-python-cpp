@@ -5,6 +5,7 @@
 #include <DolphinDB.h>
 #include <Streaming.h>
 #include <BatchTableWriter.h>
+#include <MultithreadedTableWriter.h>
 #include <DdbPythonUtil.h>
 #include <Util.h>
 #include <pybind11/numpy.h>
@@ -28,17 +29,66 @@ using std::endl;
 #define UNLIKELY(x) (x)
 #endif
 
-#define DLOG //printf
+#define DLOG //ddb::DLogger::Info
+#define RECORD_TIME //ddb::RecordTime _recordTime
 
 class DBConnectionPoolImpl {
 public:
-    DBConnectionPoolImpl(const std::string& hostName, int port, int threadNum = 10, const std::string& userId = "", const std::string& password = "", bool loadBalance = false, bool highAvailability = false, bool reConnectFlag = true,bool compress = false)
-    :dbConnectionPool_(hostName, port, threadNum, userId, password,loadBalance,highAvailability,reConnectFlag,compress), host_(hostName), port_(port), threadNum_(threadNum), userId_(userId), password_(password) {}
+    DBConnectionPoolImpl(const std::string& hostName, int port, int threadNum = 10, const std::string& userId = "", const std::string& password = "",
+            bool loadBalance = false, bool highAvailability = false, bool reConnectFlag = true,bool compress = false, bool enablePickle = true)
+            :dbConnectionPool_(hostName, port, threadNum, userId, password,loadBalance,highAvailability,reConnectFlag,compress,enablePickle),
+                host_(hostName), port_(port), threadNum_(threadNum), userId_(userId), password_(password) {}
     ~DBConnectionPoolImpl() {}
-    py::object run(const string &script, int taskId, bool clearMemory) {
+    py::object run(const string &script, int taskId) {
         try {
-             dbConnectionPool_.runPy(script, taskId, clearMemory);
+            dbConnectionPool_.runPy(script, taskId, 4, 2);
         } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in run: ") + ex.what()); }
+        return py::none();
+    }
+
+    py::object run(const string &funcName, int taskId, const py::args &args) {
+        vector<ddb::ConstantSP> ddbArgs;
+        for (py::handle one : args) {
+            py::object pyobj = py::reinterpret_borrow<py::object>(one);
+            ddb::ConstantSP pcp = ddb::DdbPythonUtil::toDolphinDB(pyobj);
+            ddbArgs.push_back(pcp);
+        }
+        try {
+            dbConnectionPool_.runPy(funcName, ddbArgs, taskId);
+        } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in call: ") + ex.what()); }
+        return py::none();
+    }
+
+    py::object run(const string &script, int taskId, const py::kwargs & kwargs) {
+        bool clearMemory = false;
+        if(kwargs.contains("clearMemory")){
+            clearMemory = kwargs["clearMemory"].cast<bool>();
+        }
+        bool pickleTableToList = false;
+        if(kwargs.contains("pickleTableToList")){
+            pickleTableToList = kwargs["pickleTableToList"].cast<bool>();
+        }
+        try {
+            dbConnectionPool_.runPy(script, taskId, 4, 2, 0, clearMemory, pickleTableToList);
+        } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in run: ") + ex.what()); }
+        //ddb::DLogger::Info(script,"cost time\n",ddb::RecordTime::printAllTime());
+        return py::none();
+    }
+
+    py::object run(const string &funcName, int taskId, const py::args &args, const py::kwargs &kwargs) {
+        bool clearMemory = false;
+        if(kwargs.contains("clearMemory")){
+            clearMemory = kwargs["clearMemory"].cast<bool>();
+        }
+        bool pickleTableToList = false;
+        if(kwargs.contains("pickleTableToList")){
+            pickleTableToList = kwargs["pickleTableToList"].cast<bool>();
+        }
+        vector<ddb::ConstantSP> ddbArgs;
+        for (auto it = args.begin(); it != args.end(); ++it) { ddbArgs.push_back(ddb::DdbPythonUtil::toDolphinDB(py::reinterpret_borrow<py::object>(*it))); }
+        try {
+            dbConnectionPool_.runPy(funcName, ddbArgs, taskId, 4, 2, 0, clearMemory,pickleTableToList);
+        } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in call: ") + ex.what()); }
         return py::none();
     }
     bool isFinished(int taskId) {
@@ -88,20 +138,16 @@ private:
 class BlockReader{
 public:
     BlockReader(ddb::BlockReaderSP reader): reader_(reader){
-        DLOG("BlockReaderbind1 %x.",reader_.get());
     }
     ~BlockReader(){
-        DLOG("~BlockReaderbind %x.",reader_.get());
     }
     void skipAll() {
         reader_->skipAll();
     }
     py::bool_ hasNext(){
-        DLOG("hasNext %x.",reader_.get());
         return py::bool_(reader_->hasNext());
     }
     py::object read(){
-        DLOG("read %x.",reader_.get());
         py::object ret;
         try{
             ret = ddb::DdbPythonUtil::toPython(reader_->read());
@@ -185,6 +231,9 @@ public:
         return dbConnection_.getSessionId();
     }
 
+    py::object loadPickleFile(const std::string &filepath){
+        return ddb::DdbPythonUtil::loadPickleFile(filepath);
+    }
     py::object upload(const py::dict &namedObjects) {
         vector<std::string> names;
         vector<ddb::ConstantSP> objs;
@@ -192,7 +241,6 @@ public:
             if (!py::isinstance(it->first, ddb::Preserved::pystr_) && !py::isinstance(it->first, ddb::Preserved::pybytes_)) { throw std::runtime_error("non-string key in upload dictionary is not allowed"); }
             names.push_back(it->first.cast<std::string>());
             objs.push_back(ddb::DdbPythonUtil::toDolphinDB(py::reinterpret_borrow<py::object>(it->second)));
-            //printf("name:%s:\n%s",names.back().data(),objs.back()->getString().data());
         }
         try {
             auto addr = dbConnection_.upload(names, objs);
@@ -212,35 +260,27 @@ public:
     py::object run(const string &script) {
         py::object result;
         try {
+            //ddb::RecordTime::printAllTime();
             result = dbConnection_.runPy(script, 4, 2);
+            DLOG(ddb::RecordTime::printAllTime());
         } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in run: ") + ex.what()); }
         return result;
     }
 
     py::object run(const string &funcName, const py::args &args) {
-        vector<ddb::ConstantSP> ddbArgs;
-        int index=0;
-        for (py::handle one : args) {
-            //printf("run param %d start10.\n", index);
-            py::object pyobj = py::reinterpret_borrow<py::object>(one);
-            //printf("run param %d start1.", index);
-            ddb::ConstantSP pcp = ddb::DdbPythonUtil::toDolphinDB(pyobj);
-            //printf("%d: %s.%s end\n", index, ddb::Util::getDataFormString(pcp->getForm()).data(), ddb::Util::getDataTypeString(pcp->getType()).data());
-            ddbArgs.push_back(pcp);
-            index++;
-        }
-        /*for (auto it = args.begin(); it != args.end(); ++it) {
-            printf("run param %d start0.\n", index);
-            py::object pyobj = py::reinterpret_borrow<py::object>(*it);
-            printf("run param %d start1.", index);
-            ddb::ConstantSP pcp = ddb::DdbPythonUtil::toDolphinDB(pyobj);
-            printf("%d: %s.%s end\n", index, ddb::Util::getDataFormString(pcp->getForm()).data(), ddb::Util::getDataTypeString(pcp->getType()).data());
-            ddbArgs.push_back(pcp);
-            index++;
-        }*/
+        //ddb::RecordTime::printAllTime();
         py::object result;
         try {
+            vector<ddb::ConstantSP> ddbArgs;
+            int index=0;
+            for (py::handle one : args) {
+                py::object pyobj = py::reinterpret_borrow<py::object>(one);
+                ddb::ConstantSP pcp = ddb::DdbPythonUtil::toDolphinDB(pyobj);
+                ddbArgs.push_back(pcp);
+                index++;
+            }
             result = dbConnection_.runPy(funcName, ddbArgs);
+            DLOG(ddb::RecordTime::printAllTime());
         } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in call: ") + ex.what()); }
         return result;
     }
@@ -250,9 +290,15 @@ public:
         if(kwargs.contains("clearMemory")){
             clearMemory = kwargs["clearMemory"].cast<bool>();
         }
+        bool pickleTableToList = false;
+        if(kwargs.contains("pickleTableToList")){
+            pickleTableToList = kwargs["pickleTableToList"].cast<bool>();
+        }
         py::object result;
         try {
-            result = dbConnection_.runPy(script, 4, 2, 0, clearMemory);
+            //ddb::RecordTime::printAllTime();
+            result = dbConnection_.runPy(script, 4, 2, 0, clearMemory, pickleTableToList);
+            DLOG(ddb::RecordTime::printAllTime());
         } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in run: ") + ex.what()); }
         return result;
     }
@@ -262,25 +308,28 @@ public:
         if(kwargs.contains("clearMemory")){
             clearMemory = kwargs["clearMemory"].cast<bool>();
         }
-        vector<ddb::ConstantSP> ddbArgs;
-        for (auto it = args.begin(); it != args.end(); ++it) { ddbArgs.push_back(ddb::DdbPythonUtil::toDolphinDB(py::reinterpret_borrow<py::object>(*it))); }
+        bool pickleTableToList = false;
+        if(kwargs.contains("pickleTableToList")){
+            pickleTableToList = kwargs["pickleTableToList"].cast<bool>();
+        }
         py::object result;
+        //ddb::RecordTime::printAllTime();
         try {
-            result = dbConnection_.runPy(funcName, ddbArgs, 4, 2, 0, clearMemory);
+            vector<ddb::ConstantSP> ddbArgs;
+            for (auto it = args.begin(); it != args.end(); ++it) { ddbArgs.push_back(ddb::DdbPythonUtil::toDolphinDB(py::reinterpret_borrow<py::object>(*it))); }
+            result = dbConnection_.runPy(funcName, ddbArgs, 4, 2, 0, clearMemory,pickleTableToList);
         } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in call: ") + ex.what()); }
+        DLOG(ddb::RecordTime::printAllTime());
         return result;
     }
 
     BlockReader runBlock(const string &script, const py::kwargs & kwargs) {
-        DLOG("runBlock1.");
         int fetchSize = 0;
         bool clearMemory = false;
         if(kwargs.contains("clearMemory")){
-            DLOG("clearMemory.");
             clearMemory = kwargs["clearMemory"].cast<bool>();
         }
         if(kwargs.contains("fetchSize")){
-            DLOG("fetchSize.");
             fetchSize = kwargs["fetchSize"].cast<int>();
         }
         if(fetchSize < 8192) {
@@ -288,12 +337,9 @@ public:
         }
         ddb::ConstantSP result;
         try {
-            DLOG("run.");
             result = dbConnection_.run(script, 4, 2, fetchSize, clearMemory);
         } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in run: ") + ex.what()); }
-        DLOG("blockReader1.");
         BlockReader blockReader(result);
-        DLOG("blockReader2.");
         return blockReader;
     }
 
@@ -535,11 +581,11 @@ public:
     void insert(const string& dbName, const string& tableName, const py::args &args){
         ddb::SmartPointer<vector<ddb::ConstantSP>> ddbArgs(new std::vector<ddb::ConstantSP>());
         int size = args.size();
-        for (int i = 0; i < size; ++i){
-            ddb::ConstantSP test = ddb::DdbPythonUtil::toDolphinDB(args[i]);
-            ddbArgs->push_back(test);
-        }
         try {
+            for (int i = 0; i < size; ++i){
+                ddb::ConstantSP test = ddb::DdbPythonUtil::toDolphinDB(args[i]);
+                ddbArgs->push_back(test);
+            }
             writer_.insertRow(dbName, tableName, ddbArgs.get());
         } catch (ddb::RuntimeException &ex) { throw std::runtime_error(std::string("<Exception> in insert: ") + ex.what()); }
     }
@@ -547,12 +593,180 @@ private:
     ddb::BatchTableWriter writer_;
 };
 
+class MultithreadedTableWriter{
+public:
+    MultithreadedTableWriter(const std::string& host, int port, const std::string& userId, const std::string& password,
+                                const string& dbPath, const string& tableName, bool useSSL, bool enableHighAvailability = false,
+                                const py::list &highAvailabilitySites = py::list(0),
+                                int batchSize = 1, float throttle = 0.01f,int threadCount = 1, const string& partitionCol ="",
+                                const py::list &compressMethods = py::list(0)){
+        try {
+            writer_ = new ddb::MultithreadedTableWriter(host, port, userId, password,
+                                dbPath, tableName, useSSL,
+                                enableHighAvailability, pylist2Stringvector(highAvailabilitySites).get(),
+                                batchSize,throttle,threadCount,partitionCol,
+                                pylist2Compressvector(compressMethods).get());
+        } catch (ddb::RuntimeException &ex) {
+            throw std::runtime_error(std::string("<Exception> in init: ") + ex.what());
+        }
+    }
+    ~MultithreadedTableWriter(){}
+    void waitForThreadCompletion(){
+        writer_->waitForThreadCompletion();
+    }
+    py::object getStatus(){
+        py::dict pystatus;
+        ddb::MultithreadedTableWriter::Status status;
+        writer_->getPytoDdb()->getStatus(status);
+        pystatus["isExiting"]=status.isExiting;
+        pystatus["errorCode"]=status.errorInfo.errorCode;
+        pystatus["errorInfo"]=status.errorInfo.errorInfo;
+        pystatus["sentRows"]=status.sentRows;
+        pystatus["unsentRows"]=status.unsentRows;
+        pystatus["sendFailedRows"]=status.sendFailedRows;
+        {
+            py::list list(status.threadStatus.size());
+            int index=0;
+            for(auto thread : status.threadStatus){
+                py::dict pythreadstatus;
+                pythreadstatus["threadId"] = thread.threadId;
+                pythreadstatus["sentRows"] = thread.sentRows;
+                pythreadstatus["unsentRows"] = thread.unsentRows;
+                pythreadstatus["sendFailedRows"] = thread.sendFailedRows;
+                list[index++] = pythreadstatus;
+            }
+            pystatus["threadStatus"]=list;
+        }
+        return pystatus;
+    }
+    py::object getUnwrittenData(){
+        try {
+            std::vector<std::vector<ddb::ConstantSP>*> unwriteDdbVecs;
+            std::vector<std::vector<py::object>*> unwritePyVecs;
+            writer_->getPytoDdb()->getUnwrittenData(unwritePyVecs, unwriteDdbVecs);
+            py::list pyunwrite(unwriteDdbVecs.size() + unwritePyVecs.size());
+            int rowindex, colindex;
+            rowindex = 0;
+            for(auto &dbvec : unwriteDdbVecs){
+                py::list pyrow(dbvec->size());
+                colindex=0;
+                for(auto &dvone : *dbvec){
+                    pyrow[colindex++] = ddb::DdbPythonUtil::toPython(dvone);
+                }
+                pyunwrite[rowindex++] = pyrow;
+                delete dbvec;
+            }
+            for(auto &pyvec : unwritePyVecs){
+                py::list pyrow(pyvec->size());
+                colindex = 0;
+                for(auto &pyone : *pyvec){
+                    pyrow[colindex++] =  pyone;
+                }
+                pyunwrite[rowindex++] = pyrow;
+                delete pyvec;
+            }
+            return pyunwrite;
+        } catch (ddb::RuntimeException &ex) {
+            throw std::runtime_error(std::string("<Exception> in getUnwrittenData: ") + ex.what());
+        }
+    }
+    py::dict insert(const py::args &args){
+        if(writer_->isExit()){
+            throw std::runtime_error(std::string("<Exception> in insert: thread is exiting."));
+        }
+        py::dict errorinfo;
+        RECORD_TIME("insert.add");
+        int size = args.size();
+        if(size != writer_->getColSize()){
+            errorinfo["errorCode"] = ddb::ErrorCodeInfo::formatApiCode(ddb::ErrorCodeInfo::EC_InvalidParameter);
+            errorinfo["errorInfo"] = std::string("Column counts don't match ") + std::to_string(writer_->getColSize());
+            return errorinfo;
+        }
+        std::vector<py::object> *pobjs=new std::vector<py::object>;
+        pobjs->reserve(size);
+        for (int i = 0; i < size; ++i){
+            pobjs->push_back(py::reinterpret_borrow<py::object>(args[i]));
+        }
+        if(writer_->getPytoDdb()->add(pobjs) == false){
+            delete pobjs;
+            if(writer_->isExit()){
+                throw std::runtime_error(std::string("<Exception> in insert: thread is exiting."));
+            }
+            errorinfo["errorCode"] = ddb::ErrorCodeInfo::formatApiCode(ddb::ErrorCodeInfo::EC_InvalidObject);
+            errorinfo["errorInfo"] = std::string("Invalid object");
+            return errorinfo;
+        }
+        errorinfo["errorCode"] = "";
+        //ddb::g_OutputDestroyMsg=false;
+        return errorinfo;
+    }
+    py::dict insertUnwrittenData(const py::list &records){
+        if(writer_->isExit()){
+            throw std::runtime_error(std::string("<Exception> in insert: thread is exiting."));
+        }
+        py::dict errorinfo;
+        //std::vector<std::vector<ddb::ConstantSP>*> vectorOfVector(records.size());
+        for(pybind11::size_t row = 0; row < records.size(); row++){
+            py::list pylist = records[row];
+            int size = pylist.size();
+            if(size != writer_->getColSize()){
+                errorinfo["errorCode"] = ddb::ErrorCodeInfo::formatApiCode(ddb::ErrorCodeInfo::EC_InvalidObject);
+                errorinfo["errorInfo"] = std::string("arg size mismatch col size ") + std::to_string(writer_->getColSize());
+                return errorinfo;
+            }
+            std::vector<py::object> *pobjs=new std::vector<py::object>;
+            pobjs->reserve(size);
+            for (int i = 0; i < size; ++i){
+                pobjs->push_back(py::reinterpret_borrow<py::object>(pylist[i]));
+            }
+            if(writer_->getPytoDdb()->add(pobjs) == false){
+                delete pobjs;
+                if(writer_->isExit()){
+                    throw std::runtime_error(std::string("<Exception> in insert: thread is exiting."));
+                }
+                errorinfo["errorCode"] = ddb::ErrorCodeInfo::formatApiCode(ddb::ErrorCodeInfo::EC_InvalidObject);
+                errorinfo["errorInfo"] = std::string("Invalid object");
+                return errorinfo;
+            }
+        }
+        errorinfo["errorCode"] = "";
+        return errorinfo;
+    }
+private:
+    static std::unique_ptr<vector<string>> pylist2Stringvector(py::list pylist){
+        std::unique_ptr<vector<string>> psites(new vector<string>);
+        for (py::handle o : pylist) { psites->emplace_back(py::cast<std::string>(o)); }
+        return psites;
+    }
+    static std::unique_ptr<vector<ddb::COMPRESS_METHOD>> pylist2Compressvector(py::list pylist){
+        std::unique_ptr<vector<ddb::COMPRESS_METHOD>> pcompresstypes(new vector<ddb::COMPRESS_METHOD>);
+        for (py::handle o : pylist) {
+            std::string typeStr = py::cast<std::string>(o);
+            transform(typeStr.begin(), typeStr.end(), typeStr.begin(), ::toupper);
+            ddb::COMPRESS_METHOD type;
+            if(typeStr == "LZ4"){
+                type=ddb::COMPRESS_LZ4;
+            }else if(typeStr == "DELTA"){
+                type=ddb::COMPRESS_DELTA;
+            }else{
+                throw std::runtime_error(std::string("Unsupported compression method ") + typeStr);
+            }
+            pcompresstypes->emplace_back(type);
+        }
+        return pcompresstypes;
+    }
+    ddb::SmartPointer<ddb::MultithreadedTableWriter> writer_;
+};
+
 PYBIND11_MODULE(dolphindbcpp, m) {
     m.doc() = R"pbdoc(dolphindbcpp: this is a C++ boosted DolphinDB Python API)pbdoc";
 
     py::class_<DBConnectionPoolImpl>(m, "dbConnectionPoolImpl")
-        .def(py::init<const std::string &,int,int,const std::string &,const std::string &,bool, bool, bool, bool>())
-        .def("run", (py::object(DBConnectionPoolImpl::*)(const std::string &, int, bool)) & DBConnectionPoolImpl::run)
+        .def(py::init<const std::string &,int,int,const std::string &,const std::string &,bool, bool, bool, bool, bool>())
+        .def("run", (py::object(DBConnectionPoolImpl::*)(const std::string &, int)) & DBConnectionPoolImpl::run)
+        .def("run", (py::object(DBConnectionPoolImpl::*)(const std::string &, int, const py::args &)) & DBConnectionPoolImpl::run)
+        .def("run", (py::object(DBConnectionPoolImpl::*)(const std::string &, int, const py::kwargs &)) & DBConnectionPoolImpl::run)
+        .def("run", (py::object(DBConnectionPoolImpl::*)(const std::string &, int, const py::args &, const py::kwargs &)) & DBConnectionPoolImpl::run)
         .def("isFinished",(bool(DBConnectionPoolImpl::*)(int)) & DBConnectionPoolImpl::isFinished)
         .def("getData",(py::object(DBConnectionPoolImpl::*)(int)) & DBConnectionPoolImpl::getData)
         .def("shutDown",&DBConnectionPoolImpl::shutDown)
@@ -579,7 +793,8 @@ PYBIND11_MODULE(dolphindbcpp, m) {
         .def("subscribeBatch", &SessionImpl::subscribeBatch)
         .def("unsubscribe", &SessionImpl::unsubscribe)
         .def("hashBucket", &SessionImpl::hashBucket)
-        .def("getSubscriptionTopics", &SessionImpl::getSubscriptionTopics);
+        .def("getSubscriptionTopics", &SessionImpl::getSubscriptionTopics)
+        .def("loadPickleFile", &SessionImpl::loadPickleFile);
     
     py::class_<BlockReader>(m, "blockReader")
         .def(py::init<ddb::BlockReaderSP>())
@@ -603,6 +818,14 @@ PYBIND11_MODULE(dolphindbcpp, m) {
         .def("getUnwrittenData", &BatchTableWriter::getUnwrittenData)
         .def("removeTable", &BatchTableWriter::removeTable)
         .def("insert", &BatchTableWriter::insert);
+
+    py::class_<MultithreadedTableWriter>(m, "multithreadedTableWriter")
+        .def(py::init<const std::string &, int, const std::string &, const std::string &,const std::string &, const std::string &, bool, bool,const py::list &, int, float,int, const std::string&,const py::list &>())
+        .def("getStatus", &MultithreadedTableWriter::getStatus)
+        .def("getUnwrittenData", &MultithreadedTableWriter::getUnwrittenData)
+        .def("insert", &MultithreadedTableWriter::insert)
+        .def("insertUnwrittenData", &MultithreadedTableWriter::insertUnwrittenData)
+        .def("waitForThreadCompletion", &MultithreadedTableWriter::waitForThreadCompletion);
 
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;

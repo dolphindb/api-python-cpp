@@ -71,9 +71,11 @@ namespace dolphindb{
         int load_reduce();
         int load_proto(IO_ERR& ret);
         int load_frame(IO_ERR& ret);
-        int load_symbol(IO_ERR& ret);
+        int load_symbol(IO_ERR& ret, char &lastDoOp);
         int load_objectBegin(IO_ERR& ret);
     private:
+        bool do_opr(char op, IO_ERR &ret);
+        bool get_opr(char &op, IO_ERR &ret);
         PyObject * obj_;
         DataInputStreamSP in_;
         UnpicklerObject * unpickler_;
