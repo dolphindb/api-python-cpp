@@ -619,8 +619,8 @@ public:
         ddb::MultithreadedTableWriter::Status status;
         writer_->getPytoDdb()->getStatus(status);
         pystatus["isExiting"]=status.isExiting;
-        pystatus["errorCode"]=status.errorInfo.errorCode;
-        pystatus["errorInfo"]=status.errorInfo.errorInfo;
+        pystatus["errorCode"]=status.errorCode;
+        pystatus["errorInfo"]=status.errorInfo;
         pystatus["sentRows"]=status.sentRows;
         pystatus["unsentRows"]=status.unsentRows;
         pystatus["sendFailedRows"]=status.sendFailedRows;

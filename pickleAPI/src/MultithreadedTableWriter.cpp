@@ -17,7 +17,8 @@ MultithreadedTableWriter::MultithreadedTableWriter(const std::string& hostName, 
                         batchSize_(batchSize),
                         throttleMilsecond_(throttle*1000),
 						hasError_(false),
-                        pytoDdb_(new PytoDdbRowPool(*this))
+						exited_(false)
+                        ,pytoDdb_(new PytoDdbRowPool(*this))
                         {
     if(threadCount < 1){
         throw RuntimeException("The parameter threadCount must be greater than or equal to 1");
@@ -193,32 +194,33 @@ MultithreadedTableWriter::MultithreadedTableWriter(const std::string& hostName, 
         writerThread.writeThread = new Thread(new SendExecutor(*this,writerThread));
         writerThread.writeThread->start();
     }
-	insertExecutor_ = new InsertExecutor(*this);
-	insertThread_ = new Thread(insertExecutor_);
-	insertThread_->start();
 }
 
 MultithreadedTableWriter::~MultithreadedTableWriter(){
     waitForThreadCompletion();
-    {
-        std::vector<ConstantSP>* pitem = NULL;
-        for(auto &thread : threads_){
-            while(thread.writeQueue.pop(pitem)){
-                delete pitem;
-            }
-            while(thread.failedQueue.pop(pitem)){
-                delete pitem;
-            }
-        }
-    }
+	{
+		std::vector<ConstantSP>* pitem = NULL;
+		for (auto &thread : threads_) {
+			while (thread.writeQueue.pop(pitem)) {
+				delete pitem;
+			}
+			while (thread.failedQueue.pop(pitem)) {
+				delete pitem;
+			}
+		}
+		while (unusedQueue_.pop(pitem)) {
+			delete pitem;
+		}
+	}
 }
 
 void MultithreadedTableWriter::waitForThreadCompletion() {
-    if(pytoDdb_->isExit())
-        return;
+	LockGuard<Mutex> LockGuard(&exitMutex_);
+	if (exited_)
+		return;
+    //if(pytoDdb_->isExit())
+    //    return;
     pytoDdb_->startExit();
-    insertExecutor_->exit();
-	insertThread_->join();
     for(auto &thread : threads_){
 		thread.exit = true;
 		thread.nonemptyNotify.notify();
@@ -231,15 +233,14 @@ void MultithreadedTableWriter::waitForThreadCompletion() {
     }
     pytoDdb_->endExit();
 	setError(0, "");
+	exited_ = true;
     //DLogger::Info(RecordTime::printAllTime());
 }
 
 void MultithreadedTableWriter::setError(int code, const string &info){
-    LockGuard<Mutex> LockGuard(&tableMutex_);
-    if(hasError_)
+    if(hasError_.exchange(true))
         return;
-    errorInfo_.set(code, info);
-	hasError_ = true;
+	errorInfo_.set(code, info);
 }
 
 bool MultithreadedTableWriter::SendExecutor::init(){
@@ -270,9 +271,9 @@ void MultithreadedTableWriter::insert(std::vector<ConstantSP> **records, int rec
 	*/
     if(threads_.size() > 1){
         if(isPartionedTable_){
-			VectorSP pvector = Util::createVector(getColDataType(partitionColumnIdx_), 0, recordCount);
+			VectorSP pvector = Util::createVector(getColDataType(partitionColumnIdx_), recordCount, 0);
             for(int i=0; i < recordCount; i++){
-                pvector->append(records[i]->at(partitionColumnIdx_));
+                pvector->set(i, records[i]->at(partitionColumnIdx_));
             }
             vector<int> threadindexes = partitionDomain_->getPartitionKeys(pvector);
             for(unsigned int row = 0; row < threadindexes.size(); row++){
@@ -293,19 +294,16 @@ void MultithreadedTableWriter::insert(std::vector<ConstantSP> **records, int rec
 }
 
 void MultithreadedTableWriter::getStatus(Status &status){
-    status.isExiting = hasError_;
-    status.errorInfo = errorInfo_;
+    status.isExiting = hasError_.load();
+    status.errorCode = errorInfo_.errorCode;
+	status.errorInfo = errorInfo_.errorInfo;
 	status.sentRows = status.unsentRows = status.sendFailedRows = 0;
-	status.threadStatus.resize(threads_.size() + 1);
-    {
-        ThreadStatus &threadStatus = status.threadStatus[0];
-        insertExecutor_->getStatus(threadStatus);
-        status.plus(threadStatus);
-    }
-	for(auto i = 0; i < threads_.size(); i++){
-        ThreadStatus &threadStatus = status.threadStatus[i + 1];
+	status.threadStatus.resize(threads_.size());
+    for(auto i = 0; i < threads_.size(); i++){
+        ThreadStatus &threadStatus = status.threadStatus[i];
         WriterThread &writeThread = threads_[i];
-        LockGuard<Mutex> LockGuard(&writeThread.writeMutex);
+		SemLock idleLock(writeThread.idleSem);
+		idleLock.acquire();
         threadStatus.threadId = writeThread.threadId;
         threadStatus.sentRows = writeThread.sentRows;
         threadStatus.unsentRows = writeThread.writeQueue.size() + writeThread.sendingRows;
@@ -315,7 +313,6 @@ void MultithreadedTableWriter::getStatus(Status &status){
 }
 
 void MultithreadedTableWriter::getUnwrittenData(std::vector<std::vector<ConstantSP>*> &unwrittenData){
-    insertExecutor_->getUnwrittenData(unwrittenData);
     for(auto &writeThread : threads_){
         SemLock idleLock(writeThread.idleSem);
         idleLock.acquire();
@@ -364,7 +361,7 @@ void MultithreadedTableWriter::SendExecutor::run(){
         while (isExit() == false && writeAllData());//write all data
     }
     //write left data
-    while (tableWriter_.hasError_ == false && writeAllData());
+    while (tableWriter_.hasError_.load() == false && writeAllData());
 }
 
 bool MultithreadedTableWriter::SendExecutor::writeAllData(){
@@ -396,18 +393,24 @@ bool MultithreadedTableWriter::SendExecutor::writeAllData(){
 		int addRowCount = 0;
         {//create table
             RECORDTIME("MTW:createTable");
-            writeTable = Util::createTable(tableWriter_.colNames_, tableWriter_.colTypes_, 0, size);
+			writeTable = Util::createTable(tableWriter_.colNames_, tableWriter_.colTypes_, size, 0);
 			writeTable->setColumnCompressMethods(tableWriter_.compressMethods_);
-            INDEX insertedRows;
-            std::string errMsg;
-            for (int i = 0; i < size; i++){
-                if(writeTable->append(*items[i], insertedRows, errMsg) == false){
-                    tableWriter_.setError(ErrorCodeInfo::EC_InvalidObject, "Failed to append data to the table: "+errMsg);
-					writeOK = false;
-                    break;
+            INDEX colSize= tableWriter_.colTypes_.size();
+			for (INDEX col = 0; col < colSize; col++) {
+				Vector *pcol = (Vector*) writeTable->getColumn(col).get();
+                std::vector<ConstantSP>** pcur = items.data();
+                if(pcol->getVectorType() != VECTOR_TYPE::ARRAYVECTOR){
+                    for (int i = 0; i < size; i++, pcur++) {
+				    	pcol->set(i, (*pcur)->at(col));
+				    }
+                }else{
+                    pcol->clear();
+                    for (int i = 0; i < size; i++, pcur++) {
+				    	pcol->append((*pcur)->at(col));
+				    }
                 }
-				addRowCount++;
-            }
+			}
+			addRowCount += size;
         }
 		if(writeOK && addRowCount > 0){//save table
             RECORDTIME("MTW:saveTable");
@@ -425,13 +428,20 @@ bool MultithreadedTableWriter::SendExecutor::writeAllData(){
                 writeThread_.conn->run(runscript);
             }
             {
-                LockGuard<Mutex> LockGuard(&writeThread_.writeMutex);
                 writeThread_.sentRows += addRowCount;
                 writeThread_.sendingRows = 0;
             }
-            for(auto &one : items){
-                delete one;
-            }
+            {
+				RECORDTIME("MTW:saveTable_clear");
+				for (auto &one : items) {
+					if (tableWriter_.unusedQueue_.size() < 65535) {
+						tableWriter_.unusedQueue_.push(one);
+					}
+					else {
+						delete one;
+					}
+				}
+			}
         }
     }catch (std::exception &e){
         DLogger::Error("threadid=", writeThread_.threadId, " Failed to save the inserted data: ", e.what()," script:", runscript);
@@ -439,78 +449,11 @@ bool MultithreadedTableWriter::SendExecutor::writeAllData(){
 		writeOK = false;
     }
     if (writeOK == false){
-        LockGuard<Mutex> LockGuard(&writeThread_.writeMutex);
         for (auto &unwriteItem : items)
             writeThread_.failedQueue.push(unwriteItem);
         writeThread_.sendingRows = 0;
-    }
-    return true;
-}
-
-MultithreadedTableWriter::InsertExecutor::InsertExecutor(MultithreadedTableWriter &tableWriter) :
-		tableWriter_(tableWriter),
-        exitWhenEmpty_(false),
-        insertingCount_(0){
-    idle_.release();
-}
-
-void MultithreadedTableWriter::InsertExecutor::getUnwrittenData(std::vector<std::vector<ConstantSP>*> &unwrittenData){
-    SemLock idleLock(idle_);
-    idleLock.acquire();
-    LockGuard<Mutex> LockGuard(&mutex_);
-    while(!rows_.empty()){
-        unwrittenData.push_back(rows_.front());
-        rows_.pop();
-    }
-    nonempty_.reset();
-}
-
-MultithreadedTableWriter::InsertExecutor::~InsertExecutor() {
-    LockGuard<Mutex> LockGuard(&mutex_);
-	while(!rows_.empty()){
-		delete rows_.front();
-        rows_.pop();
-    }
-}
-
-void MultithreadedTableWriter::InsertExecutor::getStatus(MultithreadedTableWriter::ThreadStatus &threadStatus){
-    LockGuard<Mutex> LockGuard(&mutex_);
-    threadStatus.unsentRows += rows_.size() + insertingCount_;
-}
-
-void MultithreadedTableWriter::InsertExecutor::run() {
-	vector<std::vector<ConstantSP>*> insertRows;
-	while (tableWriter_.hasError_ == false) {
-        nonempty_.wait();
-        SemLock idleLock(idle_);
-        idleLock.acquire();
-        {
-            RECORDTIME("MTW:InsertExecutor");
-            LockGuard<Mutex> LockGuard(&mutex_);
-            int size = rows_.size();
-            if(size < 1){
-                if(exitWhenEmpty_)
-                    break;
-                nonempty_.reset();
-                continue;
-            }
-			if (size > 65535)
-				size = 65535;
-			insertRows.reserve(size);
-            while(!rows_.empty()){
-                insertRows.push_back(rows_.front());
-                rows_.pop();
-                insertingCount_++;
-                if(insertRows.size() >= size)
-                    break;
-            }
-		}
-        if(!insertRows.empty()){
-            tableWriter_.insert(insertRows);
-            insertRows.clear();
-            insertingCount_ = 0;
-        }
 	}
+	return true;
 }
 
 };

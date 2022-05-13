@@ -633,22 +633,6 @@ bool VectorUnmarshall::start(short flag, bool blocking, IO_ERR& ret){
 		ret = CompressionFactory::decode(input, decompressOutput, compressHeader);
 		if (ret != OK)
 			return false;
-		char buffer[65535];
-		size_t readlen;
-		IO_ERR writeRet;
-		while(ret != END_OF_STREAM){
-			ret = input->readBytes(buffer, sizeof(buffer), readlen);
-			if (ret != END_OF_STREAM && ret != OK) {
-				return false;
-			}
-			if (readlen > 0) {
-				writeRet = decompressOutput->write(buffer, readlen);
-				if (writeRet != OK) {
-					ret = writeRet;
-					return false;
-				}
-			}
-		}
 		input = new DataInputStream(decompressOutput->getBuffer(), decompressOutput->size(), false);
 		type = (DATA_TYPE)compressHeader.dataType;
 		valueSize = compressHeader.extra;

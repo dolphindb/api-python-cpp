@@ -502,6 +502,10 @@ void DdbPythonUtil::createPyVector(const ConstantSP &obj,py::object &pyObject,bo
         case DT_STRING: {
             py::array pyVec(py::dtype("object"), {size}, {});
             for (size_t i = 0; i < size; ++i) {
+                // string &str=ddbVec->getString(i);
+                // PyObject *pstr = PyBytes_FromStringAndSize(str.data(),str.size());
+                // memcpy(pyVec.mutable_data(i), pstr, sizeof(PyObject*));
+
                 py::str temp(ddbVec->getString(i));
                 Py_IncRef(temp.ptr());
                 memcpy(pyVec.mutable_data(i), &temp, sizeof(py::object));
@@ -866,8 +870,20 @@ void AddVectorData(VectorSP &ddbVec, py::array &pyVec, DATA_TYPE type,int size) 
         {
             vector<std::string> strs;
             strs.reserve(size);
+            char *buffer;
+            ssize_t length;
             for (auto it = pyVec.begin(); it != pyVec.end(); ++it) {
-                strs.emplace_back(py::reinterpret_borrow<py::str>(*it).cast<std::string>());
+                PyObject *utf8obj = PyUnicode_AsUTF8String(it->ptr());
+                if (utf8obj != NULL){
+                    PyBytes_AsStringAndSize(utf8obj, &buffer, &length);
+                    std::string str;
+                    str.assign(buffer, (size_t)length);
+                    strs.emplace_back(std::move(str));
+                    Py_DECREF(utf8obj);
+                }else{
+                    DLOG("can't get utf-8 object from string.");
+                }
+                //strs.emplace_back(py::reinterpret_borrow<py::str>(*it).cast<std::string>());
             }
             ddbVec->appendString(strs.data(), strs.size());
             break;
@@ -1721,7 +1737,7 @@ void PytoDdbRowPool::convertLoop(){
                 delete pDdbRow;
             }
             if(!insertRows.empty()){
-                writer_.insertExecutor_->add(insertRows);
+                writer_.insertUnwrittenData(insertRows);
             }
             if (insertRows.size() != convertRows.size()){ // has error, rows left some
                 LockGuard<Mutex> LockGuard(&mutex_);
@@ -1739,13 +1755,15 @@ void PytoDdbRowPool::convertLoop(){
 void PytoDdbRowPool::getStatus(MultithreadedTableWriter::Status &status){
     py::gil_scoped_release release;
     writer_.getStatus(status);
+    MultithreadedTableWriter::ThreadStatus threadStatus;
     LockGuard<Mutex> guard(&mutex_);
     status.unsentRows += rows_.size() + convertingCount_;
     status.sendFailedRows += failedRows_.size();
-    if(!status.threadStatus.empty()){
-        status.threadStatus.front().unsentRows += rows_.size() + convertingCount_;
-        status.threadStatus.front().sendFailedRows += failedRows_.size();
-    }
+    
+    threadStatus.unsentRows += rows_.size() + convertingCount_;
+    threadStatus.sendFailedRows += failedRows_.size();
+    
+    status.threadStatus.insert(status.threadStatus.begin(),threadStatus);
 }
 void PytoDdbRowPool::getUnwrittenData(vector<vector<py::object>*> &pyData,vector<vector<ConstantSP>*> &ddbData){
     py::gil_scoped_release release;

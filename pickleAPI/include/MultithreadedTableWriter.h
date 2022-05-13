@@ -39,10 +39,9 @@ public:
             sentRows = unsentRows = sendFailedRows = 0;
         }
     };
-    struct Status{
+    struct Status : ErrorCodeInfo{
         bool isExiting;
-        ErrorCodeInfo errorInfo;
-		long sentRows, unsentRows, sendFailedRows;
+        long sentRows, unsentRows, sendFailedRows;
         std::vector<ThreadStatus> threadStatus;
         void plus(const ThreadStatus &threadStatus){
             sentRows += threadStatus.sentRows;
@@ -63,9 +62,9 @@ public:
     void getStatus(Status &status);
     void getUnwrittenData(std::vector<std::vector<ConstantSP>*> &unwrittenData);
     void insert(std::vector<ConstantSP> **records, int recordCount);
-	void insert(std::vector<std::vector<ConstantSP>*> &records) { insert(records.data(), records.size()); }
+	void insertUnwrittenData(std::vector<std::vector<ConstantSP>*> &records) { insert(records.data(), records.size()); }
     void waitForThreadCompletion();
-    bool isExit(){ return hasError_; }
+    bool isExit(){ return hasError_.load(); }
 
     const DATA_TYPE* getColType(){ return colTypes_.data(); }
     int getColSize(){ return colTypes_.size(); }
@@ -73,7 +72,7 @@ public:
     template<typename... TArgs>
     bool insert(ErrorCodeInfo &errorInfo, TArgs... args){
         RECORDTIME("MTW:insertValue");
-        if(hasError_){
+        if(hasError_.load()){
 			throw RuntimeException("Thread is exiting.");
         }
 		{
@@ -89,13 +88,20 @@ public:
 			ConstantSP result[] = { Util::createObject(getColDataType(colIndex++), args, &errorInfo)... };
 			if (errorInfo.hasError())
 				return false;
-			insertExecutor_->add(result, colTypes_.size());
+			std::vector<ConstantSP>* prow;
+			if (!unusedQueue_.pop(prow)) {
+				prow = new std::vector<ConstantSP>;
+			}
+			prow->resize(colIndex);
+			for (int i = 0; i < colIndex; i++) {
+				prow->at(i) = result[i];
+			}
+			insert(&prow, 1);
 		}
         return true;
     }
-    void setError(int code, const string &info);
-
 private:
+	void setError(int code, const string &info);
     DATA_TYPE getColDataType(int colIndex) {
 		DATA_TYPE dataType = colTypes_[colIndex];
 		if (dataType >= ARRAY_TYPE_BASE)
@@ -112,7 +118,6 @@ private:
         ThreadSP writeThread;
         ConditionalNotifier nonemptyNotify;
 
-        Mutex writeMutex;
         Semaphore idleSem;
         unsigned int threadId;
         long sentRows, sendingRows;
@@ -125,47 +130,12 @@ private:
                         writeThread_(writeThread){};
         virtual void run();
     private:
-		bool isExit() { return tableWriter_.hasError_ || writeThread_.exit; }
+		bool isExit() { return tableWriter_.hasError_.load() || writeThread_.exit; }
         bool init();
         bool writeAllData();
         MultithreadedTableWriter &tableWriter_;
         WriterThread &writeThread_;
     };
-	class InsertExecutor : public dolphindb::Runnable {
-	public:
-		InsertExecutor(MultithreadedTableWriter &tableWriter);
-		~InsertExecutor();
-		virtual void run();
-		void exit() {
-            exitWhenEmpty_ = true;
-            nonempty_.set();
-		}
-		void add(const ConstantSP* row, int size){
-			std::vector<ConstantSP> *pvectorRow = new std::vector<ConstantSP>;
-			pvectorRow->resize(size);
-			for (int i = 0; i < size; i++)
-				pvectorRow->at(i) = row[i];
-            LockGuard<Mutex> LockGuard(&mutex_);
-			rows_.push(pvectorRow);
-            nonempty_.set();
-		}
-        void add(const vector<vector<ConstantSP>*> &rows){
-            LockGuard<Mutex> LockGuard(&mutex_);
-            for(auto &one : rows)
-			    rows_.push(one);
-            nonempty_.set();
-		}
-        void getUnwrittenData(std::vector<std::vector<ConstantSP>*> &unwrittenData);
-        void getStatus(MultithreadedTableWriter::ThreadStatus &threadStatus);
-	private:
-		MultithreadedTableWriter &tableWriter_;
-        int insertingCount_;
-        bool exitWhenEmpty_;
-        Semaphore idle_;
-        Signal nonempty_;
-        Mutex mutex_;
-		std::queue<vector<ConstantSP>*> rows_;
-	};
     
 private:
     friend class SendExecutor;
@@ -174,7 +144,8 @@ private:
     const std::string tableName_;
     const int batchSize_;
     const int throttleMilsecond_;
-    bool isPartionedTable_, hasError_;
+    bool isPartionedTable_, exited_;
+	std::atomic_bool hasError_;
     std::vector<string> colNames_,colTypeString_;
     std::vector<DATA_TYPE> colTypes_;
 	std::vector<COMPRESS_METHOD> compressMethods_;
@@ -184,12 +155,11 @@ private:
     int threadByColIndexForNonPartion_;
 	//End of following parameters only valid in multithread mode
     std::vector<WriterThread> threads_;
-	ThreadSP insertThread_;
-	SmartPointer<InsertExecutor> insertExecutor_;
-    Mutex tableMutex_;
+	Mutex exitMutex_;
     ErrorCodeInfo errorInfo_;
     std::string scriptTableInsert_;
     std::string scriptSaveTable_;
+	SynchronizedQueue<std::vector<ConstantSP>*> unusedQueue_;
     friend class PytoDdbRowPool;
     PytoDdbRowPool *pytoDdb_;
 public:
